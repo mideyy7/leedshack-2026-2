@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import networkx as nx
 import numpy as np
+import lightgbm as lgb
+import joblib
 import re
 import os
 
@@ -21,8 +23,12 @@ app.add_middleware(
 graph = None
 shipments_df = None
 weather_df = None
+risk_classifier = None
+delay_regressor = None
+predictions_cache = None  # dict of trip_uuid -> {risk, expected_delay_hours}
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 
 def load_shipments():
@@ -170,12 +176,152 @@ def load_weather():
     print(f"Weather merged: {matched_exact} exact, {matched_state} state-level, {matched_fallback} fallback")
 
 
+# --- Phase 4: Feature engineering & LightGBM training ---
+
+FEATURE_COLS = [
+    "osrm_time", "actual_distance_to_destination", "segment_osrm_time",
+    "segment_osrm_distance", "factor", "segment_factor",
+    "temperature", "humidity", "wind_speed", "rain_1h", "snow_1h",
+    "route_type_encoded", "weather_main_encoded",
+    "hour_of_day", "day_of_week", "is_peak_hour",
+]
+
+
+def _build_feature_df():
+    """Build a feature DataFrame by merging shipment rows with graph weather attributes."""
+    df = shipments_df.copy()
+
+    # Parse temporal features from od_start_time
+    df["od_start_time_parsed"] = pd.to_datetime(df["od_start_time"], format="mixed", dayfirst=False, errors="coerce")
+    df["hour_of_day"] = df["od_start_time_parsed"].dt.hour.fillna(12).astype(int)
+    df["day_of_week"] = df["od_start_time_parsed"].dt.dayofweek.fillna(0).astype(int)
+    df["is_peak_hour"] = df["hour_of_day"].apply(lambda h: 1 if 7 <= h <= 10 or 16 <= h <= 20 else 0)
+
+    # Encode categoricals
+    route_map = {rt: i for i, rt in enumerate(df["route_type"].dropna().unique())}
+    df["route_type_encoded"] = df["route_type"].map(route_map).fillna(0).astype(int)
+
+    # Merge weather from source node
+    weather_lookup = {}
+    if graph is not None:
+        for node, attrs in graph.nodes(data=True):
+            if "temperature" in attrs:
+                weather_lookup[node] = {k: attrs[k] for k in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]}
+
+    weather_main_categories = set()
+    for w in weather_lookup.values():
+        weather_main_categories.add(w["weather_main"])
+
+    weather_main_map = {wm: i for i, wm in enumerate(sorted(weather_main_categories))}
+
+    for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
+        df[col] = df["source_name"].map(lambda n, c=col: weather_lookup.get(n, {}).get(c, 0.0))
+
+    df["weather_main_raw"] = df["source_name"].map(lambda n: weather_lookup.get(n, {}).get("weather_main", "Clouds"))
+    df["weather_main_encoded"] = df["weather_main_raw"].map(weather_main_map).fillna(0).astype(int)
+
+    # Define targets
+    # Classification: delayed if factor > 1.5 (actual took 50%+ longer than OSRM estimate)
+    df["is_delayed"] = (df["factor"] > 1.5).astype(int)
+
+    # Regression: delay in hours = (actual_time - osrm_time) / 60, clipped to >= 0
+    df["delay_hours"] = ((df["actual_time"] - df["osrm_time"]) / 60).clip(lower=0)
+
+    # Fill NaN in feature columns
+    for col in FEATURE_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    return df, weather_main_map
+
+
+def train_models():
+    """Train LightGBM classifier and regressor, save to disk."""
+    global risk_classifier, delay_regressor
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    clf_path = os.path.join(MODEL_DIR, "classifier.pkl")
+    reg_path = os.path.join(MODEL_DIR, "regressor.pkl")
+    meta_path = os.path.join(MODEL_DIR, "meta.pkl")
+
+    # If models already exist, load them
+    if os.path.exists(clf_path) and os.path.exists(reg_path):
+        risk_classifier = joblib.load(clf_path)
+        delay_regressor = joblib.load(reg_path)
+        print("Loaded existing models from disk")
+        return
+
+    print("Training LightGBM models...")
+    df, weather_main_map = _build_feature_df()
+
+    X = df[FEATURE_COLS].values
+    y_cls = df["is_delayed"].values
+    y_reg = df["delay_hours"].values
+
+    # Train classifier
+    risk_classifier = lgb.LGBMClassifier(
+        n_estimators=100, max_depth=6, learning_rate=0.1,
+        num_leaves=31, verbose=-1, n_jobs=-1,
+    )
+    risk_classifier.fit(X, y_cls)
+
+    # Train regressor
+    delay_regressor = lgb.LGBMRegressor(
+        n_estimators=100, max_depth=6, learning_rate=0.1,
+        num_leaves=31, verbose=-1, n_jobs=-1,
+    )
+    delay_regressor.fit(X, y_reg)
+
+    # Save models and metadata
+    joblib.dump(risk_classifier, clf_path)
+    joblib.dump(delay_regressor, reg_path)
+    joblib.dump({"weather_main_map": weather_main_map}, meta_path)
+
+    print(f"Models trained and saved. Delay rate: {y_cls.mean():.2%}, Mean delay: {y_reg.mean():.1f}h")
+
+
+def compute_predictions():
+    """Run predictions for all shipments and cache results."""
+    global predictions_cache
+
+    if risk_classifier is None or delay_regressor is None:
+        print("WARNING: Models not loaded, skipping predictions")
+        return
+
+    df, _ = _build_feature_df()
+    X = df[FEATURE_COLS].values
+
+    risk_probs = risk_classifier.predict_proba(X)[:, 1]
+    delay_hours = delay_regressor.predict(X)
+
+    # Aggregate per trip_uuid (take max risk and max delay across segments)
+    df["risk"] = risk_probs
+    df["predicted_delay_hours"] = np.clip(delay_hours, 0, None)
+
+    trip_preds = df.groupby("trip_uuid").agg(
+        risk=("risk", "max"),
+        expected_delay_hours=("predicted_delay_hours", "max"),
+    )
+
+    predictions_cache = {
+        uid: {
+            "risk": round(float(row["risk"]), 4),
+            "expected_delay_hours": round(float(row["expected_delay_hours"]), 2),
+        }
+        for uid, row in trip_preds.iterrows()
+    }
+
+    print(f"Predictions computed for {len(predictions_cache)} unique trips")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load data on startup."""
     print("Starting up Chain-Reaction API...")
     load_shipments()
     load_weather()
+    train_models()
+    compute_predictions()
 
 
 @app.get("/")
@@ -248,4 +394,30 @@ async def weather_stats():
         "nodes_without_weather": nodes_without,
         "weather_records_loaded": len(weather_df) if weather_df is not None else 0,
         "sample_node_with_weather": sample,
+    }
+
+
+@app.get("/risk/stats")
+async def risk_stats():
+    """Return risk model statistics to verify Phase 4."""
+    if predictions_cache is None:
+        return {"error": "Predictions not computed"}
+
+    risks = [v["risk"] for v in predictions_cache.values()]
+    delays = [v["expected_delay_hours"] for v in predictions_cache.values()]
+
+    # Sample top-5 riskiest trips
+    sorted_trips = sorted(predictions_cache.items(), key=lambda x: x[1]["risk"], reverse=True)
+    top_5 = {uid: pred for uid, pred in sorted_trips[:5]}
+
+    return {
+        "total_trips": len(predictions_cache),
+        "risk_mean": round(float(np.mean(risks)), 4),
+        "risk_max": round(float(np.max(risks)), 4),
+        "risk_min": round(float(np.min(risks)), 4),
+        "delay_mean_hours": round(float(np.mean(delays)), 2),
+        "delay_max_hours": round(float(np.max(delays)), 2),
+        "high_risk_trips": sum(1 for r in risks if r > 0.7),
+        "models_loaded": risk_classifier is not None and delay_regressor is not None,
+        "top_5_riskiest": top_5,
     }
