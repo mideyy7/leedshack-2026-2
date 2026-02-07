@@ -397,6 +397,14 @@ async def weather_stats():
     }
 
 
+@app.post("/predict")
+async def predict():
+    """Return risk predictions for all shipments (Phase 5)."""
+    if predictions_cache is None:
+        return {"error": "Predictions not computed yet"}
+    return predictions_cache
+
+
 @app.get("/risk/stats")
 async def risk_stats():
     """Return risk model statistics to verify Phase 4."""
