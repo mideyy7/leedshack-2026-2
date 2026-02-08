@@ -282,21 +282,17 @@ function App() {
     { name: 'Worst Case', delay: +topSimulation.worst_case.toFixed(1), fill: '#ff3864' },
   ] : [];
 
-  // Top 15 mitigations (Solana txs first, then by original risk)
+  // FILTERED: Only show mitigations that have a solana_tx (On-Chain Only)
   const mitigationList = mitigations
     ? Object.entries(mitigations)
         .map(([uid, m]) => ({ trip_uuid: uid, ...m }))
-        .sort((a, b) => {
-          if (a.solana_tx && !b.solana_tx) return -1;
-          if (!a.solana_tx && b.solana_tx) return 1;
-          return (b.original_risk || 0) - (a.original_risk || 0);
-        })
+        .filter(m => m.solana_tx) // Exclude off-chain
+        .sort((a, b) => (b.original_risk || 0) - (a.original_risk || 0)) // Sort by risk
         .slice(0, 15)
     : [];
 
-  // On-chain vs off-chain counts
-  const onChainCount = mitigationList.filter(m => m.solana_tx).length;
-  const offChainCount = mitigationList.length - onChainCount;
+  // Count of On-Chain (since we filtered, this is just the list length)
+  const onChainCount = mitigationList.length;
 
   // Estimated cost of inaction across all predicted shipments
   const costOfInaction = predictions
@@ -578,10 +574,7 @@ function App() {
                     }}
                     labelStyle={{ color: '#e6e9f0', fontWeight: 600, marginBottom: 4 }}
                     animationDuration={200}
-                    formatter={(value, name) => [
-                      `${value}h`,
-                      name === 'actual' ? 'Actual Delay' : 'Predicted Delay',
-                    ]}
+                    formatter={(value) => [`${value}h`]}
                   />
                   <Legend
                     wrapperStyle={{ color: '#c0c7d6', fontSize: '0.75rem', fontFamily: 'Space Mono' }}
@@ -755,6 +748,7 @@ function App() {
                             fontFamily: 'Space Mono',
                             fontSize: '0.8rem',
                           }}
+                          itemStyle={{ color: '#e6e9f0' }}
                           labelStyle={{ color: '#e6e9f0', fontWeight: 700, marginBottom: 6, fontSize: '0.85rem' }}
                           cursor={{ fill: 'rgba(255,255,255,0.04)', radius: 4 }}
                           animationDuration={200}
@@ -788,18 +782,12 @@ function App() {
         <div className={`tab-content ${activeTab === 'mitigations' ? 'active' : ''}`}>
           {!analysisRun ? renderNotRunPlaceholder('Mitigations') : (
             <>
-              {/* On-chain vs Off-chain Comparison */}
+              {/* On-chain Summary */}
               <div className="chain-comparison">
-                <div className="chain-stat">
+                <div className="chain-stat" style={{ width: '100%', borderRight: 'none' }}>
                   <span className="chain-count on-chain">{onChainCount}</span>
-                  <span className="chain-label">On-Chain</span>
-                  <span className="chain-desc">Recorded on Solana devnet</span>
-                </div>
-                <div className="chain-divider" />
-                <div className="chain-stat">
-                  <span className="chain-count off-chain">{offChainCount}</span>
-                  <span className="chain-label">Off-Chain</span>
-                  <span className="chain-desc">Local mitigation only</span>
+                  <span className="chain-label">On-Chain Actions</span>
+                  <span className="chain-desc">High-risk strategies recorded on Solana</span>
                 </div>
               </div>
 
@@ -810,19 +798,16 @@ function App() {
                 </div>
 
                 {mitigationList.length > 0 ? mitigationList.map(m => {
-                  const isOnChain = (m.original_risk || 0) >= 0.75;
                   const story = stories?.[m.trip_uuid];
                   const memoPayload = `ChainReaction|${m.trip_uuid}|risk:${((m.original_risk || 0) * 100).toFixed(0)}%|${m.strategy}`;
 
                   return (
                     <div key={m.trip_uuid} className="mitigation-card">
-                      {/* Header: readable ID + threshold badge + Solana link */}
+                      {/* Header: readable ID + On-Chain badge + Solana link */}
                       <div className="mitigation-header">
                         <div className="mitigation-id-row">
                           <span className="mitigation-trip-id">{readableId(m.trip_uuid)}</span>
-                          <span className={`threshold-badge ${isOnChain ? 'on-chain' : 'off-chain'}`}>
-                            {isOnChain ? 'ON-CHAIN' : 'OFF-CHAIN'}
-                          </span>
+                          <span className="threshold-badge on-chain">ON-CHAIN</span>
                         </div>
                         {m.solana_tx && !m.solana_tx.startsWith('DEMO_') ? (
                           <a
@@ -833,9 +818,9 @@ function App() {
                           >
                             View TX
                           </a>
-                        ) : m.solana_tx ? (
+                        ) : (
                           <span className="solana-demo-badge">On-Chain</span>
-                        ) : null}
+                        )}
                       </div>
 
                       {/* Strategy name */}
@@ -876,16 +861,16 @@ function App() {
                           <span className="timeline-time">{pipelineCompletedAt || '--'}</span>
                         </div>
                         <div className="timeline-connector" />
-                        <div className={`timeline-step ${m.solana_tx ? 'completed' : 'skipped'}`}>
+                        <div className="timeline-step completed">
                           <div className="timeline-dot" />
-                          <span className="timeline-label">{m.solana_tx ? 'Recorded On-Chain' : 'Local Only'}</span>
-                          <span className="timeline-time">{m.solana_tx ? (pipelineCompletedAt || '--') : 'N/A'}</span>
+                          <span className="timeline-label">Recorded On-Chain</span>
+                          <span className="timeline-time">{pipelineCompletedAt || '--'}</span>
                         </div>
                       </div>
                     </div>
                   );
                 }) : (
-                  <p className="loading-text">No mitigations computed</p>
+                  <p className="loading-text">No on-chain mitigations computed</p>
                 )}
               </div>
             </>
@@ -898,3 +883,4 @@ function App() {
 }
 
 export default App;
+
