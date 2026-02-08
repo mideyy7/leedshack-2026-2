@@ -265,9 +265,14 @@ function App() {
 
   // ─── Derived Data ───
 
-  // Top 10 riskiest shipments for table
+  // Top 10 riskiest shipments for table (Descending risk)
   const top10 = predictions
     ? [...predictions].sort((a, b) => b.risk - a.risk).slice(0, 10)
+    : [];
+
+  // Bottom 10 riskiest (Safest) shipments for table (Ascending risk)
+  const bottom10 = predictions
+    ? [...predictions].sort((a, b) => a.risk - b.risk).slice(0, 10)
     : [];
 
   // Most volatile shipment for What-If
@@ -675,7 +680,9 @@ function App() {
                 </span>
               </div>
 
+              {/* Grid with Two Tables: Top 10 Riskiest and Bottom 10 Riskiest */}
               <div className="grid">
+                {/* Panel 1: Top 10 Riskiest */}
                 <div className="panel">
                   <div className="panel-header">
                     <span className="panel-title">Top 10 Riskiest Shipments</span>
@@ -695,6 +702,36 @@ function App() {
                           <td className="mono">{readableId(p.trip_uuid)}</td>
                           <td>
                             <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
+                              {(p.risk * 100).toFixed(1)}%
+                            </span>
+                          </td>
+                          <td>{formatDelay(p.expected_delay_hours)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Panel 2: Bottom 10 Safest */}
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Bottom 10 Riskiest (Safest)</span>
+                    <span className="panel-badge">Low Risk</span>
+                  </div>
+                  <table className="pred-table">
+                    <thead>
+                      <tr>
+                        <th>Trip ID</th>
+                        <th>Risk %</th>
+                        <th>Expected Delay</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bottom10.map(p => (
+                        <tr key={p.trip_uuid}>
+                          <td className="mono">{readableId(p.trip_uuid)}</td>
+                          <td>
+                            <span className="risk-badge low">
                               {(p.risk * 100).toFixed(1)}%
                             </span>
                           </td>
