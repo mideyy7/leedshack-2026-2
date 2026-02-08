@@ -7,6 +7,8 @@ import lightgbm as lgb
 import joblib
 import re
 import os
+import time
+import json
 from solana.rpc.api import Client as SolanaClient
 from solders.keypair import Keypair as SolanaKeypair
 from solders.pubkey import Pubkey
@@ -42,6 +44,10 @@ SOLANA_RPC_URL = "https://api.devnet.solana.com"
 MEMO_PROGRAM_ID = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
 HIGH_RISK_THRESHOLD = 0.7
 SOLANA_ENABLED = os.environ.get("SOLANA_ENABLED", "true").lower() == "true"
+
+# Global Wallet (Initialize as None, setup on startup)
+authority_keypair = None 
+solana_client = None
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -447,49 +453,59 @@ def _select_strategy(risk):
 
 
 def _trigger_solana_memo(trip_uuid, risk, action_desc):
-    """Send a memo transaction to Solana devnet for audit trail. Returns tx signature or None."""
-    import time
+    """
+    Send a memo transaction to Solana devnet.
+    Uses the global authority_keypair to sign.
+    """
+    global solana_client, authority_keypair
+
+    if not SOLANA_ENABLED or solana_client is None or authority_keypair is None:
+        return None
+
     try:
-        client = SolanaClient(SOLANA_RPC_URL)
-        keypair = SolanaKeypair()
-
-        memo_text = f"ChainReaction|{trip_uuid}|risk:{risk:.2f}|action:{action_desc}"
-        memo_bytes = memo_text.encode("utf-8")[:566]  # memo max ~566 bytes
-
+        # Create the log message
+        # Format: AppName | ID | Risk | Action
+        memo_text = f"ChainReaction|{trip_uuid}|risk:{risk:.2f}|{action_desc}"
+        
+        # Ensure message fits within Memo program limits
+        memo_bytes = memo_text.encode("utf-8")
+        
+        # 1. Create the Instruction
         ix = Instruction(
             program_id=MEMO_PROGRAM_ID,
-            accounts=[AccountMeta(pubkey=keypair.pubkey(), is_signer=True, is_writable=True)],
+            accounts=[
+                AccountMeta(pubkey=authority_keypair.pubkey(), is_signer=True, is_writable=True)
+            ],
             data=memo_bytes,
         )
 
-        # Airdrop SOL for tx fee
-        airdrop_resp = client.request_airdrop(keypair.pubkey(), 1_000_000_000)  # 1 SOL
-        # Wait for airdrop confirmation
-        time.sleep(3)
+        # 2. Get Recent Blockhash
+        latest_blockhash_resp = solana_client.get_latest_blockhash()
+        recent_blockhash = latest_blockhash_resp.value.blockhash
 
-        # Get a recent blockhash and build transaction
-        resp = client.get_latest_blockhash()
-        blockhash = resp.value.blockhash
-
+        # 3. Create Transaction Message
         msg = SolanaMessage.new_with_blockhash(
-            [ix], keypair.pubkey(), blockhash
-        )
-        tx = SolanaTransaction.new(
-            [keypair], msg, blockhash
+            [ix], 
+            authority_keypair.pubkey(), 
+            recent_blockhash
         )
 
-        result = client.send_raw_transaction(bytes(tx))
+        # 4. Sign and Build Transaction
+        tx = SolanaTransaction.new_unsigned(msg)
+        tx.sign([authority_keypair], recent_blockhash)
+
+        # 5. Send Transaction
+        # skip_preflight=True is faster but risks failure if logic is wrong. 
+        # For memos, it's usually safe.
+        result = solana_client.send_transaction(tx)
+        
         sig = str(result.value)
-        print(f"Solana tx for {trip_uuid}: {sig}")
+        print(f"Solana Log Success: https://explorer.solana.com/tx/{sig}?cluster=devnet")
         return sig
+
     except Exception as e:
         print(f"Solana tx failed for {trip_uuid}: {e}")
-        # Demo fallback: generate a deterministic mock signature for hackathon presentation
-        import hashlib
-        mock_sig = hashlib.sha256(f"ChainReaction:{trip_uuid}:{risk}".encode()).hexdigest()[:88]
-        print(f"Using demo signature for {trip_uuid}")
-        return f"DEMO_{mock_sig}"
-
+        return None
 
 def compute_mitigations():
     """Generate mitigation strategies for high-risk shipments, optionally trigger Solana."""
@@ -566,6 +582,56 @@ def _get_weather_cause(trip_uuid):
         return weather.lower()
     return None
 
+def setup_solana_wallet():
+    """Initialize the global wallet and fund it if necessary."""
+    global authority_keypair, solana_client
+    
+    if not SOLANA_ENABLED:
+        print("Solana integration disabled via config.")
+        return
+
+    try:
+        solana_client = SolanaClient(SOLANA_RPC_URL)
+        
+        # --- FIXED LOADING LOGIC ---
+        if os.path.exists("authority_keypair.json"):
+            with open("authority_keypair.json", "r") as f:
+                raw = f.read()
+                # Load the list of integers from JSON
+                key_list = json.loads(raw)
+                # Convert list back to bytes for the Keypair constructor
+                authority_keypair = SolanaKeypair.from_bytes(bytes(key_list))
+                print(f"Loaded existing Solana Wallet: {authority_keypair.pubkey()}")
+        else:
+            # --- FIXED SAVING LOGIC ---
+            authority_keypair = SolanaKeypair()
+            # Convert keypair to bytes, then to a standard Python list for JSON
+            key_as_list = list(bytes(authority_keypair))
+            
+            with open("authority_keypair.json", "w") as f:
+                f.write(json.dumps(key_as_list))
+            print(f"Generated NEW Solana Wallet: {authority_keypair.pubkey()}")
+
+        # Check Balance
+        print("Checking balance...")
+        balance_resp = solana_client.get_balance(authority_keypair.pubkey())
+        lamports = balance_resp.value
+        
+        # If low balance (< 0.5 SOL), request airdrop
+        if lamports < 500_000_000:
+            print(f"Balance low ({lamports} lamports). Requesting Devnet Airdrop...")
+            try:
+                # 1 SOL = 1,000,000,000 Lamports
+                solana_client.request_airdrop(authority_keypair.pubkey(), 1_000_000_000)
+                time.sleep(2) 
+                print("Airdrop requested successfully.")
+            except Exception as e:
+                print(f"Airdrop failed (might be rate limited): {e}")
+        else:
+            print(f"Wallet funded: {lamports / 1_000_000_000:.2f} SOL")
+
+    except Exception as e:
+        print(f"Failed to initialize Solana: {e}")
 
 def _build_story(trip_uuid, pred, sim_data, mitigation_data):
     """Generate a human-readable journey story for a shipment."""
@@ -668,6 +734,7 @@ async def startup_event():
     load_shipments()
     load_weather()
     train_models()
+    setup_solana_wallet()
     print("Startup complete. Awaiting /run-analysis to execute pipeline.")
 
 
