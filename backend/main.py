@@ -105,6 +105,9 @@ def _extract_city(node_name):
 
 
 def _extract_state(node_name):
+    if pd.isna(node_name):
+        return None
+    
     """Extract state from node like 'Agra_Central_D_3 (Uttar Pradesh)' -> 'Uttar Pradesh'."""
     match = re.search(r"\(([^)]+)\)", node_name)
     return match.group(1) if match else None
