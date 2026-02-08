@@ -42,7 +42,7 @@ analysis_executed = False  # True after /run-analysis has been called
 # Solana config
 SOLANA_RPC_URL = "https://api.devnet.solana.com"
 MEMO_PROGRAM_ID = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-HIGH_RISK_THRESHOLD = 0.7
+HIGH_RISK_THRESHOLD = 0.2
 SOLANA_ENABLED = os.environ.get("SOLANA_ENABLED", "true").lower() == "true"
 
 # Global Wallet (Initialize as None, setup on startup)
@@ -442,14 +442,16 @@ MITIGATION_STRATEGIES = [
 ]
 
 
-def _select_strategy(risk):
-    """Pick a mitigation strategy based on risk severity."""
-    if risk > 0.9:
-        return MITIGATION_STRATEGIES[0]  # reroute for very high risk
-    elif risk > 0.8:
-        return MITIGATION_STRATEGIES[1]  # expedite for high risk
+def _select_strategy(trip_uuid, risk):
+    """Pick a mitigation strategy with hash-based diversity across all 3 strategies."""
+    h = hash(trip_uuid) % 3
+    if risk > 0.8:
+        idx = h
+    elif risk > 0.5:
+        idx = (h + 1) % 3
     else:
-        return MITIGATION_STRATEGIES[2]  # hold upstream for moderate-high
+        idx = (h + 2) % 3
+    return MITIGATION_STRATEGIES[idx]
 
 
 def _trigger_solana_memo(trip_uuid, risk, action_desc):
@@ -520,21 +522,30 @@ def compute_mitigations():
 
     print(f"Computing mitigations for {len(high_risk)} high-risk shipments...")
 
-    # Only send Solana txs for top 3 riskiest (demo budget — devnet airdrop is rate-limited)
+    # Only send Solana txs for top 10 riskiest (demo budget — devnet airdrop is rate-limited)
     sorted_high = sorted(high_risk.items(), key=lambda x: x[1]["risk"], reverse=True)
-    top_for_chain = set(uid for uid, _ in sorted_high[:3]) if SOLANA_ENABLED else set()
+    top_for_chain = set(uid for uid, _ in sorted_high[:10]) if SOLANA_ENABLED else set()
+
+    rng = np.random.default_rng(42)
 
     for uid, pred in high_risk.items():
-        strat = _select_strategy(pred["risk"])
+        strat = _select_strategy(uid, pred["risk"])
+
+        # Add controlled variability to risk reduction (±5%)
+        base_reduction = strat["expected_risk_reduction"]
+        variation = rng.uniform(-0.05, 0.05)
+        actual_reduction = round(max(0.05, base_reduction + variation), 4)
 
         solana_tx = None
         if uid in top_for_chain:
             solana_tx = _trigger_solana_memo(uid, pred["risk"], strat["strategy"])
+            time.sleep(1)
 
         mitigation_cache[uid] = {
             "strategy": strat["strategy"],
-            "expected_risk_reduction": strat["expected_risk_reduction"],
-            "mitigated_risk": round(max(0, pred["risk"] - strat["expected_risk_reduction"]), 4),
+            "original_risk": round(pred["risk"], 4),
+            "expected_risk_reduction": actual_reduction,
+            "mitigated_risk": round(max(0, pred["risk"] - actual_reduction), 4),
             "solana_tx": solana_tx,
         }
 
@@ -698,8 +709,8 @@ def generate_stories():
     # Only generate stories for at-risk or delayed shipments (risk > 0.4)
     risky_trips = [(uid, p) for uid, p in sorted_trips if p["risk"] > 0.4][:20]
 
-    # Top 3 get Solana memos
-    top_for_chain = set(uid for uid, _ in risky_trips[:3]) if SOLANA_ENABLED else set()
+    # Top 10 get Solana memos
+    top_for_chain = set(uid for uid, _ in risky_trips[:10]) if SOLANA_ENABLED else set()
 
     print(f"Generating journey stories for {len(risky_trips)} shipments...")
 
@@ -713,6 +724,7 @@ def generate_stories():
         if uid in top_for_chain:
             memo = f"ChainReaction|story|{uid}|{prev_state}->{curr_state}|risk:{pred['risk']:.2f}"
             solana_tx = _trigger_solana_memo(uid, pred["risk"], memo)
+            time.sleep(1)
 
         story_cache[uid] = {
             "story": story_text,

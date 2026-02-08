@@ -1095,6 +1095,242 @@ body {
   .hero-stats { flex-direction: row; flex-wrap: wrap; }
 }
 
+/* ===== Chain Comparison (On-chain vs Off-chain) ===== */
+.chain-comparison {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--grid-line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.chain-stat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1.5rem;
+  gap: 0.3rem;
+}
+
+.chain-count {
+  font-family: 'Syne', sans-serif;
+  font-size: 2.5rem;
+  font-weight: 700;
+}
+
+.chain-count.on-chain { color: var(--accent-purple); }
+.chain-count.off-chain { color: var(--text-secondary); }
+
+.chain-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-primary);
+}
+
+.chain-desc {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+}
+
+.chain-divider {
+  width: 1px;
+  background: var(--grid-line);
+  align-self: stretch;
+}
+
+/* ===== Threshold Badge ===== */
+.threshold-badge {
+  font-size: 0.55rem;
+  font-weight: 700;
+  padding: 0.15rem 0.4rem;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.threshold-badge.on-chain {
+  background: rgba(168, 85, 247, 0.2);
+  color: var(--accent-purple);
+  border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.threshold-badge.off-chain {
+  background: rgba(139, 146, 168, 0.1);
+  color: var(--text-secondary);
+  border: 1px solid var(--grid-line);
+}
+
+/* ===== Mitigation ID Row ===== */
+.mitigation-id-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.mitigation-trip-id {
+  font-family: 'Syne', sans-serif;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--accent-blue);
+}
+
+/* ===== Embedded Narrative ===== */
+.embedded-narrative {
+  margin-top: 0.8rem;
+  padding: 0.8rem 1rem;
+  background: rgba(255, 255, 255, 0.02);
+  border-left: 2px solid var(--accent-warning);
+  border-radius: 0 4px 4px 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.7;
+  font-style: italic;
+}
+
+/* ===== Decision Hash Preview ===== */
+.decision-hash {
+  margin-top: 0.8rem;
+  padding: 0.6rem 0.8rem;
+  background: rgba(10, 14, 20, 0.6);
+  border: 1px solid var(--grid-line);
+  border-radius: 4px;
+}
+
+.hash-label {
+  display: block;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+
+.hash-value {
+  font-family: 'Space Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--accent-purple);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+/* ===== Decision Timeline ===== */
+.decision-timeline {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-top: 0.8rem;
+  padding: 0.6rem 0;
+}
+
+.timeline-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+  flex: 0 0 auto;
+}
+
+.timeline-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  border: 2px solid var(--grid-line);
+}
+
+.timeline-step.completed .timeline-dot {
+  background: var(--accent-safe);
+  border-color: var(--accent-safe);
+  box-shadow: 0 0 6px rgba(0, 255, 136, 0.3);
+}
+
+.timeline-step.skipped .timeline-dot {
+  background: var(--text-secondary);
+  border-color: var(--grid-line);
+  opacity: 0.4;
+}
+
+.timeline-connector {
+  flex: 1;
+  height: 2px;
+  background: var(--grid-line);
+  min-width: 20px;
+}
+
+.timeline-label {
+  font-size: 0.6rem;
+  color: var(--text-secondary);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.timeline-time {
+  font-size: 0.55rem;
+  font-family: 'Space Mono', monospace;
+  color: var(--text-secondary);
+  opacity: 0.5;
+}
+
+/* ===== Cost of Inaction Metric ===== */
+.cost-metric {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  background: rgba(255, 56, 100, 0.05);
+  border: 1px solid rgba(255, 56, 100, 0.2);
+  border-radius: 4px;
+}
+
+.cost-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+}
+
+.cost-value {
+  font-family: 'Syne', sans-serif;
+  font-size: 2.2rem;
+  font-weight: 700;
+  color: var(--accent-critical);
+  line-height: 1;
+}
+
+.cost-desc {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+  text-align: center;
+}
+
+/* ===== Micro Copy ===== */
+.micro-copy {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.7;
+  margin-bottom: 1.5rem;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--grid-line);
+}
+
+/* ===== Section Tag ===== */
+.section-tag {
+  font-size: 0.65rem;
+  font-weight: 400;
+  color: var(--accent-blue);
+  margin-left: 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 @media (max-width: 768px) {
   .header-content {
     flex-direction: column;

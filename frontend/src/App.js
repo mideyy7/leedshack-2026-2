@@ -5,6 +5,7 @@ import './App.css';
 
 const API_BASE_URL = 'http://localhost:8000';
 const SOLANA_EXPLORER = 'https://explorer.solana.com/tx';
+const CARGO_COST_PER_HOUR = 1200;
 
 // Pipeline step definitions for the live execution log
 const PIPELINE_STEPS = [
@@ -14,6 +15,17 @@ const PIPELINE_STEPS = [
   { key: 'mitigation', label: 'Computing autonomous mitigation strategies' },
   { key: 'solana', label: 'Recording mitigation decisions on Solana devnet' },
 ];
+
+// Helpers
+const formatDelay = (hours) => {
+  if (hours >= 24) return `${hours.toFixed(1)}h (~${(hours / 24).toFixed(1)} days)`;
+  return `${hours.toFixed(1)}h`;
+};
+
+const readableId = (uuid) => {
+  const digits = uuid.replace(/\D/g, '');
+  return `trip-${digits.slice(-5).padStart(5, '0')}`;
+};
 
 function App() {
   // ─── Core State ───
@@ -35,6 +47,7 @@ function App() {
   const [pipelineSteps, setPipelineSteps] = useState([]);
   const [pipelineError, setPipelineError] = useState(null);
   const [pipelineSummary, setPipelineSummary] = useState(null);
+  const [pipelineCompletedAt, setPipelineCompletedAt] = useState(null);
 
   // ─── Interactive Graph ───
   const [nodePositions, setNodePositions] = useState({});
@@ -189,6 +202,7 @@ function App() {
     } else {
       setPipelineSummary(backendResult);
       setAnalysisRun(true);
+      setPipelineCompletedAt(new Date().toLocaleTimeString());
       setLastUpdate(0);
     }
 
@@ -287,22 +301,26 @@ function App() {
     { name: 'Worst Case', delay: +topSimulation.worst_case.toFixed(1), fill: '#ff3864' },
   ] : [];
 
-  // Top 3 mitigations (Solana txs first)
+  // Top 15 mitigations (Solana txs first, then by original risk)
   const mitigationList = mitigations
     ? Object.entries(mitigations)
         .map(([uid, m]) => ({ trip_uuid: uid, ...m }))
         .sort((a, b) => {
           if (a.solana_tx && !b.solana_tx) return -1;
           if (!a.solana_tx && b.solana_tx) return 1;
-          return (b.expected_risk_reduction || 0) - (a.expected_risk_reduction || 0);
+          return (b.original_risk || 0) - (a.original_risk || 0);
         })
-        .slice(0, 3)
+        .slice(0, 15)
     : [];
 
-  // Top 3 journey stories
-  const storyList = stories
-    ? Object.entries(stories).map(([uid, s]) => ({ trip_uuid: uid, ...s })).slice(0, 3)
-    : [];
+  // On-chain vs off-chain counts
+  const onChainCount = mitigationList.filter(m => m.solana_tx).length;
+  const offChainCount = mitigationList.length - onChainCount;
+
+  // Estimated cost of inaction across all predicted shipments
+  const costOfInaction = predictions
+    ? predictions.reduce((sum, p) => sum + p.risk * p.expected_delay_hours * CARGO_COST_PER_HOUR, 0)
+    : 0;
 
   const isHealthy = apiStatus?.status === 'healthy';
 
@@ -490,7 +508,7 @@ function App() {
         {[
           { key: 'overview', label: 'Overview' },
           { key: 'analysis', label: 'Analysis' },
-          { key: 'solana', label: 'Solana & Mitigations' },
+          { key: 'mitigations', label: 'Mitigations' },
         ].map(tab => (
           <button
             key={tab.key}
@@ -582,13 +600,31 @@ function App() {
 
         {/* ═══════════════════════════════════════════════
             TAB 2 — ANALYSIS
-            Combined: Risk & Forecast + Journey Stories + What-If
+            Combined: Risk & Forecast + What-If (Monte Carlo)
         ═══════════════════════════════════════════════ */}
         <div className={`tab-content ${activeTab === 'analysis' ? 'active' : ''}`}>
           {!analysisRun ? renderNotRunPlaceholder('Analysis') : (
             <>
-              {/* ── Section: Risk & Forecast ── */}
-              <div className="section-heading">Risk & Forecast</div>
+              {/* ── Section: Risk & Forecast (ML) ── */}
+              <div className="section-heading">
+                Risk & Forecast <span className="section-tag">ML — LightGBM</span>
+              </div>
+              <p className="micro-copy">
+                Risk scores are computed per-shipment using a LightGBM classifier trained on historical
+                delays, weather severity, and route complexity. Higher scores indicate greater disruption probability.
+              </p>
+
+              {/* Estimated Cost of Inaction */}
+              <div className="cost-metric">
+                <span className="cost-label">Estimated Cost of Inaction</span>
+                <span className="cost-value">
+                  ${costOfInaction.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+                <span className="cost-desc">
+                  Projected loss without mitigation (risk × delay × $1,200/hr cargo cost)
+                </span>
+              </div>
+
               <div className="grid">
                 <div className="panel">
                   <div className="panel-header">
@@ -606,13 +642,13 @@ function App() {
                     <tbody>
                       {top10.map(p => (
                         <tr key={p.trip_uuid}>
-                          <td className="mono">{p.trip_uuid.slice(-12)}</td>
+                          <td className="mono">{readableId(p.trip_uuid)}</td>
                           <td>
                             <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
                               {(p.risk * 100).toFixed(1)}%
                             </span>
                           </td>
-                          <td>{p.expected_delay_hours.toFixed(1)}h</td>
+                          <td>{formatDelay(p.expected_delay_hours)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -620,37 +656,19 @@ function App() {
                 </div>
               </div>
 
-              {/* ── Section: Journey Stories ── */}
-              <div className="section-heading">Journey Stories</div>
-              <div className="grid">
-                <div className="panel">
-                  <div className="panel-header">
-                    <span className="panel-title">Shipment Narratives</span>
-                    <span className="panel-badge">Top 3</span>
-                  </div>
-                  {storyList.length > 0 ? storyList.map(s => (
-                    <div key={s.trip_uuid} className={`story-card ${s.current_state === 'delayed' ? 'critical' : ''}`}>
-                      <div className="story-header">
-                        <span className="story-id">{s.trip_uuid.slice(-12)}</span>
-                        <span className={`risk-badge ${s.risk > 0.7 ? 'high' : s.risk > 0.4 ? 'medium' : 'low'}`}>
-                          {(s.risk * 100).toFixed(0)}%
-                        </span>
-                      </div>
-                      <div className="story-text">{s.story}</div>
-                    </div>
-                  )) : (
-                    <p className="loading-text">No stories available</p>
-                  )}
-                </div>
-              </div>
-
               {/* ── Section: What-If (Monte Carlo) ── */}
-              <div className="section-heading">What-If (Monte Carlo)</div>
+              <div className="section-heading">
+                What-If Scenarios <span className="section-tag">Monte Carlo — 100 Runs</span>
+              </div>
+              <p className="micro-copy">
+                Each shipment is simulated 100 times with perturbed weather and timing variables.
+                The spread between best and worst case reveals supply chain fragility.
+              </p>
               {topSimulation && (
                 <div className="grid">
                   <div className="panel">
                     <div className="panel-header">
-                      <span className="panel-title">Most Volatile: {topSimulation.trip_uuid.slice(-12)}</span>
+                      <span className="panel-title">Most Volatile: {readableId(topSimulation.trip_uuid)}</span>
                       <span className="panel-badge">100 Scenarios</span>
                     </div>
                     <p className="chart-subtitle">Simulated delay outcomes for the most volatile shipment</p>
@@ -673,10 +691,10 @@ function App() {
                     </ResponsiveContainer>
                     <p className="whatif-explanation">
                       Across 100 simulated futures, this shipment's delay ranges from{' '}
-                      <span className="text-safe">{topSimulation.best_case.toFixed(1)}h</span> to{' '}
-                      <span className="text-critical">{topSimulation.worst_case.toFixed(1)}h</span>.
+                      <span className="text-safe">{formatDelay(topSimulation.best_case)}</span> to{' '}
+                      <span className="text-critical">{formatDelay(topSimulation.worst_case)}</span>.
                       There is a 10% chance delays exceed{' '}
-                      <span className="text-warning">{topSimulation.p90.toFixed(1)}h</span>.
+                      <span className="text-warning">{formatDelay(topSimulation.p90)}</span>.
                     </p>
                   </div>
                 </div>
@@ -686,48 +704,113 @@ function App() {
         </div>
 
         {/* ═══════════════════════════════════════════════
-            TAB 3 — SOLANA & MITIGATIONS
+            TAB 3 — MITIGATIONS
+            Autonomous mitigation with Solana audit trail
         ═══════════════════════════════════════════════ */}
-        <div className={`tab-content ${activeTab === 'solana' ? 'active' : ''}`}>
-          {!analysisRun ? renderNotRunPlaceholder('Solana & Mitigations') : (
-            <div className="grid">
+        <div className={`tab-content ${activeTab === 'mitigations' ? 'active' : ''}`}>
+          {!analysisRun ? renderNotRunPlaceholder('Mitigations') : (
+            <>
+              {/* On-chain vs Off-chain Comparison */}
+              <div className="chain-comparison">
+                <div className="chain-stat">
+                  <span className="chain-count on-chain">{onChainCount}</span>
+                  <span className="chain-label">On-Chain</span>
+                  <span className="chain-desc">Recorded on Solana devnet</span>
+                </div>
+                <div className="chain-divider" />
+                <div className="chain-stat">
+                  <span className="chain-count off-chain">{offChainCount}</span>
+                  <span className="chain-label">Off-Chain</span>
+                  <span className="chain-desc">Local mitigation only</span>
+                </div>
+              </div>
+
               <div className="panel">
                 <div className="panel-header">
-                  <span className="panel-title">Autonomous Mitigation</span>
-                  <span className="panel-badge">Solana Devnet</span>
+                  <span className="panel-title">Autonomous Mitigations</span>
+                  <span className="panel-badge">{mitigationList.length} Shipments</span>
                 </div>
-                {mitigationList.length > 0 ? mitigationList.map(m => (
-                  <div key={m.trip_uuid} className="mitigation-card">
-                    <div className="mitigation-header">
-                      <span className="mitigation-action">{m.strategy}</span>
-                      {m.solana_tx && !m.solana_tx.startsWith('DEMO_') ? (
-                        <a
-                          href={`${SOLANA_EXPLORER}/${m.solana_tx}?cluster=devnet`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="solana-link"
-                        >
-                          View TX
-                        </a>
-                      ) : m.solana_tx ? (
-                        <span className="solana-demo-badge">On-Chain</span>
-                      ) : null}
+
+                {mitigationList.length > 0 ? mitigationList.map(m => {
+                  const isOnChain = (m.original_risk || 0) >= 0.75;
+                  const story = stories?.[m.trip_uuid];
+                  const memoPayload = `ChainReaction|${m.trip_uuid}|risk:${((m.original_risk || 0) * 100).toFixed(0)}%|${m.strategy}`;
+
+                  return (
+                    <div key={m.trip_uuid} className="mitigation-card">
+                      {/* Header: readable ID + threshold badge + Solana link */}
+                      <div className="mitigation-header">
+                        <div className="mitigation-id-row">
+                          <span className="mitigation-trip-id">{readableId(m.trip_uuid)}</span>
+                          <span className={`threshold-badge ${isOnChain ? 'on-chain' : 'off-chain'}`}>
+                            {isOnChain ? 'ON-CHAIN' : 'OFF-CHAIN'}
+                          </span>
+                        </div>
+                        {m.solana_tx && !m.solana_tx.startsWith('DEMO_') ? (
+                          <a
+                            href={`${SOLANA_EXPLORER}/${m.solana_tx}?cluster=devnet`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="solana-link"
+                          >
+                            View TX
+                          </a>
+                        ) : m.solana_tx ? (
+                          <span className="solana-demo-badge">On-Chain</span>
+                        ) : null}
+                      </div>
+
+                      {/* Strategy name */}
+                      <div className="mitigation-action">{m.strategy}</div>
+
+                      {/* Risk stats */}
+                      <div className="mitigation-desc">
+                        Risk: <span className="text-critical">{((m.original_risk || 0) * 100).toFixed(1)}%</span>
+                        {' \u2192 '}
+                        <span className="text-safe">{(m.mitigated_risk * 100).toFixed(1)}%</span>
+                        {' (reduced by '}
+                        <span className="text-safe">{(m.expected_risk_reduction * 100).toFixed(1)}%</span>
+                        {')'}
+                      </div>
+
+                      {/* Embedded journey narrative */}
+                      {story && (
+                        <div className="embedded-narrative">{story.story}</div>
+                      )}
+
+                      {/* Decision Hash Preview */}
+                      <div className="decision-hash">
+                        <span className="hash-label">Memo Payload</span>
+                        <code className="hash-value">{memoPayload}</code>
+                      </div>
+
+                      {/* Decision Timeline */}
+                      <div className="decision-timeline">
+                        <div className="timeline-step completed">
+                          <div className="timeline-dot" />
+                          <span className="timeline-label">Risk Detected</span>
+                          <span className="timeline-time">{pipelineCompletedAt || '--'}</span>
+                        </div>
+                        <div className="timeline-connector" />
+                        <div className="timeline-step completed">
+                          <div className="timeline-dot" />
+                          <span className="timeline-label">Strategy Selected</span>
+                          <span className="timeline-time">{pipelineCompletedAt || '--'}</span>
+                        </div>
+                        <div className="timeline-connector" />
+                        <div className={`timeline-step ${m.solana_tx ? 'completed' : 'skipped'}`}>
+                          <div className="timeline-dot" />
+                          <span className="timeline-label">{m.solana_tx ? 'Recorded On-Chain' : 'Local Only'}</span>
+                          <span className="timeline-time">{m.solana_tx ? (pipelineCompletedAt || '--') : 'N/A'}</span>
+                        </div>
+                      </div>
                     </div>
-                    <div className="mitigation-desc">
-                      <span className="mono">{m.trip_uuid.slice(-12)}</span>
-                      {' — '}Risk reduced by <span className="text-safe">{(m.expected_risk_reduction * 100).toFixed(0)}%</span>.
-                      Mitigated risk: <span className="text-warning">{(m.mitigated_risk * 100).toFixed(1)}%</span>.
-                    </div>
-                  </div>
-                )) : (
+                  );
+                }) : (
                   <p className="loading-text">No mitigations computed</p>
                 )}
-                <p className="whatif-explanation" style={{ marginTop: '1.5rem' }}>
-                  When risk exceeds threshold, the system autonomously commits the mitigation
-                  decision on-chain for auditability.
-                </p>
               </div>
-            </div>
+            </>
           )}
         </div>
 
