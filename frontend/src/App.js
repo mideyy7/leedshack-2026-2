@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import * as d3 from 'd3';
 import axios from 'axios';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, PieChart, Pie, Cell, LineChart, Line, AreaChart, Area } from 'recharts';
 import './App.css';
@@ -23,20 +24,15 @@ function App() {
   const [lastUpdate, setLastUpdate] = useState(0);
   const PAGE_SIZE = 20;
 
-  // Analysis state
+  // --- ZOOM STATE ---
+  const svgRef = useRef(null);
+  const [transform, setTransform] = useState(d3.zoomIdentity);
+
+  // --- LIVE TIMER & ANALYSIS STATE ---
   const [analysisRun, setAnalysisRun] = useState(false);
   const [runLoading, setRunLoading] = useState(false);
   const [runResult, setRunResult] = useState(null);
 
-  // Interactive graph state
-  const [nodePositions, setNodePositions] = useState({});
-  const [dragNode, setDragNode] = useState(null);
-  const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 800, h: 500 });
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState(null);
-  const svgRef = useRef(null);
-
-  // Live update timer
   useEffect(() => {
     const interval = setInterval(() => {
       setLastUpdate((prev) => prev + 3);
@@ -44,6 +40,7 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // --- INITIAL HEALTH CHECK ---
   useEffect(() => {
     checkApiHealth();
   }, []);
@@ -62,6 +59,7 @@ function App() {
     }
   };
 
+  // --- DATA FETCHERS ---
   const fetchPredictions = useCallback(async () => {
     setPredLoading(true);
     try {
@@ -121,47 +119,42 @@ function App() {
       const response = await axios.get(`${API_BASE_URL}/graph/viz`);
       if (!response.data.error) {
         setGraphData(response.data);
-        // Initialize node positions using circular layout
-        if (response.data.nodes && Object.keys(nodePositions).length === 0) {
-          const nodes = response.data.nodes;
-          const uniqueLabels = [...new Set(nodes.map((n) => n.label))];
-          const width = 800;
-          const height = 500;
-          const padding = 80;
-          const positions = {};
-          nodes.forEach((node, i) => {
-            const labelIdx = uniqueLabels.indexOf(node.label);
-            const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
-            const radius = Math.min(width, height) / 2 - padding;
-            const jitter = (i % 3) * 18;
-            positions[node.id] = {
-              x: width / 2 + (radius - jitter) * Math.cos(angle),
-              y: height / 2 + (radius - jitter) * Math.sin(angle),
-            };
-          });
-          setNodePositions(positions);
-        }
       }
     } catch (error) {
       console.error('Failed to fetch graph data:', error);
     }
-  }, [nodePositions]);
+  }, []);
 
-  // Fetch graph on startup (structural data only, no analysis needed)
+  // Fetch graph on startup
   useEffect(() => {
     if (apiStatus?.graph_loaded) {
       fetchGraphData();
     }
   }, [apiStatus, fetchGraphData]);
 
-  // Fetch analysis data only after analysis has been run
+  // --- D3 ZOOM EFFECT (The Critical Fix) ---
+  useEffect(() => {
+    if (!svgRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    const zoom = d3.zoom()
+      .scaleExtent([0.1, 10]) 
+      .on('zoom', (event) => {
+        setTransform(event.transform);
+      });
+
+    svg.call(zoom);
+    svg.style("user-select", "none");
+  }, [loading, graphData]); // Re-run when data loads
+
+  // --- MAIN DATA LOAD EFFECT ---
   useEffect(() => {
     if (analysisRun) {
       fetchPredictions();
       fetchSimulations();
       fetchMitigations();
       fetchStories();
-      fetchGraphData(); // re-fetch with risk coloring
+      fetchGraphData();
     }
   }, [analysisRun, fetchPredictions, fetchSimulations, fetchMitigations, fetchStories, fetchGraphData]);
 
@@ -184,72 +177,7 @@ function App() {
     setRunLoading(false);
   };
 
-  // --- Interactive graph mouse handlers ---
-  const getSVGPoint = (e) => {
-    const svg = svgRef.current;
-    if (!svg) return { x: 0, y: 0 };
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX;
-    pt.y = e.clientY;
-    const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
-    return { x: svgP.x, y: svgP.y };
-  };
-
-  const handleNodeMouseDown = (e, nodeId) => {
-    e.stopPropagation();
-    setDragNode(nodeId);
-  };
-
-  const handleSvgMouseDown = (e) => {
-    if (dragNode) return;
-    setIsPanning(true);
-    setPanStart({ x: e.clientX, y: e.clientY, vx: viewBox.x, vy: viewBox.y });
-  };
-
-  const handleSvgMouseMove = (e) => {
-    if (dragNode) {
-      const pt = getSVGPoint(e);
-      setNodePositions((prev) => ({
-        ...prev,
-        [dragNode]: { x: pt.x, y: pt.y },
-      }));
-    } else if (isPanning && panStart) {
-      const svg = svgRef.current;
-      if (!svg) return;
-      const scale = viewBox.w / svg.clientWidth;
-      const dx = (e.clientX - panStart.x) * scale;
-      const dy = (e.clientY - panStart.y) * scale;
-      setViewBox((prev) => ({
-        ...prev,
-        x: panStart.vx - dx,
-        y: panStart.vy - dy,
-      }));
-    }
-  };
-
-  const handleSvgMouseUp = () => {
-    setDragNode(null);
-    setIsPanning(false);
-    setPanStart(null);
-  };
-
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
-    const svg = svgRef.current;
-    if (!svg) return;
-
-    const pt = getSVGPoint(e);
-    setViewBox((prev) => {
-      const newW = prev.w * zoomFactor;
-      const newH = prev.h * zoomFactor;
-      const newX = pt.x - (pt.x - prev.x) * zoomFactor;
-      const newY = pt.y - (pt.y - prev.y) * zoomFactor;
-      return { x: newX, y: newY, w: Math.max(200, Math.min(2000, newW)), h: Math.max(125, Math.min(1250, newH)) };
-    });
-  };
-
-  // Sorting
+  // --- DATA PROCESSING HELPERS ---
   const sortedPredictions = predictions
     ? [...predictions].sort((a, b) => {
         const mul = sortDir === 'desc' ? -1 : 1;
@@ -269,7 +197,6 @@ function App() {
     }
   };
 
-  // Risk chart data: top 30 riskiest
   const chartData = predictions
     ? [...predictions]
         .sort((a, b) => b.risk - a.risk)
@@ -292,7 +219,6 @@ function App() {
     fill: getRiskColor(entry.risk),
   }));
 
-  // Simulation chart data: top 20 by worst_case spread
   const simChartData = simulations
     ? [...simulations]
         .sort((a, b) => (b.worst_case - b.best_case) - (a.worst_case - a.best_case))
@@ -307,12 +233,10 @@ function App() {
         }))
     : [];
 
-  // Selected simulation for detail view (top volatile)
   const topSimulation = simulations
     ? [...simulations].sort((a, b) => (b.worst_case - b.best_case) - (a.worst_case - a.best_case))[0]
     : null;
 
-  // Mitigations: sorted by Solana txs first, then risk reduction
   const mitigationList = mitigations
     ? Object.entries(mitigations)
         .map(([uid, m]) => ({ trip_uuid: uid, ...m }))
@@ -323,12 +247,10 @@ function App() {
         })
     : [];
 
-  // Stories list
   const storyList = stories
     ? Object.entries(stories).map(([uid, s]) => ({ trip_uuid: uid, ...s }))
     : [];
 
-  // Summary stats (only available after analysis)
   const stats = predictions
     ? {
         total: predictions.length,
@@ -340,12 +262,10 @@ function App() {
       }
     : null;
 
-  // High risk shipments for overview sidebar
   const highRiskShipments = predictions
     ? [...predictions].sort((a, b) => b.risk - a.risk).slice(0, 10)
     : [];
 
-  // Risk distribution pie chart data
   const riskPieData = predictions
     ? (() => {
         const low = predictions.filter((p) => p.risk <= 0.4).length;
@@ -359,7 +279,6 @@ function App() {
       })()
     : [];
 
-  // Delay over time line chart
   const delayLineData = predictions
     ? (() => {
         const sorted = [...predictions].sort((a, b) => a.expected_delay_hours - b.expected_delay_hours);
@@ -379,7 +298,6 @@ function App() {
       })()
     : [];
 
-  // Delay distribution histogram for Monte Carlo tab
   const delayDistribution = simulations
     ? (() => {
         const delays = simulations.map((s) => s.expected_delay_hours);
@@ -401,123 +319,102 @@ function App() {
       })()
     : [];
 
-  // Interactive network graph renderer
-  const renderInteractiveGraph = () => {
+  // --- NETWORK GRAPH RENDERER ---
+  const renderNetworkGraph = () => {
     if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
       return <p className="loading-text">Loading supply chain graph...</p>;
     }
 
-    const nodes = graphData.nodes;
+    const nodes = [...graphData.nodes].sort((a, b) => b.risk - a.risk);    
     const edges = graphData.edges;
+    const width = 800;
+    const height = 500;
+    const padding = 60;
 
-    // Node type shapes
-    const getNodeRadius = (node) => {
-      if (analysisRun) return 6 + node.risk * 12;
-      const typeSize = { hub: 10, port: 9, warehouse: 8, supplier: 7 };
-      return typeSize[node.type] || 7;
-    };
+    const uniqueLabels = [...new Set(nodes.map((n) => n.label))];
+    const nodePositions = {};
+    nodes.forEach((node, i) => {
+      const labelIdx = uniqueLabels.indexOf(node.label);
+      const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
+      
+      const spiralOffset = (i * 3); 
+      // Adjusted spread logic for 1600 nodes
+      const radius = (Math.min(width, height) / 2 - padding) + (i % 8 * 30);
+      
+      nodePositions[node.id] = {
+        x: width / 2 + (radius + spiralOffset) * Math.cos(angle),
+        y: height / 2 + (radius + spiralOffset) * Math.sin(angle),
+      };
+    });
 
     return (
-      <svg
-        ref={svgRef}
-        viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`}
-        className="network-graph interactive"
-        onMouseDown={handleSvgMouseDown}
-        onMouseMove={handleSvgMouseMove}
-        onMouseUp={handleSvgMouseUp}
-        onMouseLeave={handleSvgMouseUp}
-        onWheel={handleWheel}
+      <svg 
+        ref={svgRef} 
+        viewBox={`0 0 ${width} ${height}`} 
+        className="network-graph"
+        style={{ cursor: 'move', width: '100%', height: '500px', background: '#0d1117' }}
       >
         <defs>
           <marker id="arrowhead" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
             <polygon points="0 0, 6 2, 0 4" fill="#8b92a8" opacity="0.5" />
           </marker>
-          <filter id="glow">
-            <feGaussianBlur stdDeviation="3" result="coloredBlur" />
-            <feMerge>
-              <feMergeNode in="coloredBlur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
         </defs>
-
-        {/* Edges */}
-        {edges.slice(0, 150).map((edge, i) => {
-          const src = nodePositions[edge.source];
-          const tgt = nodePositions[edge.target];
-          if (!src || !tgt) return null;
-          return (
-            <line
-              key={`e-${i}`}
-              x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
-              stroke={edge.color}
-              strokeWidth="1"
-              opacity="0.35"
-              markerEnd="url(#arrowhead)"
-            />
-          );
-        })}
-
-        {/* Nodes */}
-        {nodes.slice(0, 80).map((node) => {
-          const pos = nodePositions[node.id];
-          if (!pos) return null;
-          const r = getNodeRadius(node);
-          return (
-            <g
-              key={node.id}
-              style={{ cursor: 'grab' }}
-              onMouseDown={(e) => handleNodeMouseDown(e, node.id)}
-            >
-              <circle
-                cx={pos.x} cy={pos.y} r={r}
-                fill={node.color}
-                opacity="0.85"
-                stroke={node.color}
-                strokeWidth="2"
-                filter={r > 9 ? 'url(#glow)' : undefined}
-              />
-              <text
-                x={pos.x} y={pos.y - r - 4}
-                textAnchor="middle"
-                fill="#8b92a8"
-                fontSize="7"
-                fontFamily="Space Mono"
-              >
-                {node.label}
-              </text>
-              {/* State indicator for pre-analysis */}
-              {!analysisRun && (
-                <circle
-                  cx={pos.x + r - 2} cy={pos.y - r + 2} r="2.5"
-                  fill="#00ff88"
-                  stroke="none"
-                />
-              )}
-            </g>
-          );
-        })}
-
-        {/* Legend */}
-        <g transform={`translate(${viewBox.x + viewBox.w - 140}, ${viewBox.y + 15})`}>
-          <rect x="0" y="0" width="130" height={analysisRun ? 75 : 55} fill="rgba(20,25,32,0.85)" rx="4" stroke="rgba(139,146,168,0.12)" />
-          {analysisRun ? (
-            <>
-              <circle cx="15" cy="18" r="5" fill="#00ff88" />
-              <text x="28" y="22" fill="#8b92a8" fontSize="8" fontFamily="Space Mono">Low Risk</text>
-              <circle cx="15" cy="38" r="5" fill="#ffd700" />
-              <text x="28" y="42" fill="#8b92a8" fontSize="8" fontFamily="Space Mono">Medium Risk</text>
-              <circle cx="15" cy="58" r="5" fill="#ff3864" />
-              <text x="28" y="62" fill="#8b92a8" fontSize="8" fontFamily="Space Mono">High Risk</text>
-            </>
-          ) : (
-            <>
-              <circle cx="15" cy="18" r="5" fill="#3b82f6" />
-              <text x="28" y="22" fill="#8b92a8" fontSize="8" fontFamily="Space Mono">Supply Node</text>
-              <circle cx="15" cy="38" r="2.5" fill="#00ff88" />
-              <text x="28" y="42" fill="#8b92a8" fontSize="8" fontFamily="Space Mono">On-Time</text>
-            </>
-          )}
+        
+        {/* ZOOM WRAPPER */}
+        <g transform={transform.toString()}>
+            {edges.map((edge, i) => {
+                const src = nodePositions[edge.source];
+                const tgt = nodePositions[edge.target];
+                if (!src || !tgt) return null;
+                return (
+                    <line
+                        key={`e-${i}`}
+                        x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
+                        stroke={edge.color}
+                        strokeWidth="0.5"
+                        opacity="0.1"
+                        markerEnd="url(#arrowhead)"
+                    />
+                );
+            })}
+            {nodes.map((node) => {
+                const pos = nodePositions[node.id];
+                if (!pos) return null;
+                return (
+                    <g key={node.id}>
+                        <circle
+                            cx={pos.x} cy={pos.y} r={3 + node.risk * 5}
+                            fill={node.color}
+                            opacity="0.8"
+                            stroke="#fff"
+                            strokeWidth="0.2"
+                        />
+                        {/* High risk labels only */}
+                        {node.risk > 0.7 && (
+                            <text
+                                x={pos.x} y={pos.y - 8}
+                                textAnchor="middle"
+                                fill="#8b92a8"
+                                fontSize="6"
+                                fontFamily="Space Mono"
+                            >
+                                {node.label}
+                            </text>
+                        )}
+                    </g>
+                );
+            })}
+        </g>
+        
+        {/* Legend (Fixed position, outside zoom group) */}
+        <g transform={`translate(${width - 130}, 20)`}>
+          <rect x="0" y="0" width="120" height="70" fill="rgba(20,25,32,0.9)" rx="4" />
+          <circle cx="15" cy="18" r="5" fill="#00ff88" />
+          <text x="28" y="22" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Low Risk</text>
+          <circle cx="15" cy="38" r="5" fill="#ffd700" />
+          <text x="28" y="42" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Medium Risk</text>
+          <circle cx="15" cy="58" r="5" fill="#ff3864" />
+          <text x="28" y="62" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">High Risk</text>
         </g>
       </svg>
     );
@@ -655,7 +552,7 @@ function App() {
                   <p className="chart-subtitle">
                     Explore the supply chain digital twin. Drag nodes to rearrange. Scroll to zoom. All nodes currently on-time.
                   </p>
-                  {renderInteractiveGraph()}
+                  {renderNetworkGraph()}
                 </div>
               </div>
 
@@ -852,7 +749,7 @@ function App() {
                     <span className="panel-badge">Color-coded by Risk</span>
                   </div>
                   <p className="chart-subtitle">Nodes sized by risk score. Green = safe, Yellow = warning, Red = critical. Drag to rearrange.</p>
-                  {renderInteractiveGraph()}
+                  {renderNetworkGraph()}
                 </div>
               </div>
 
@@ -994,7 +891,7 @@ function App() {
                       <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
                         <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
-                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} />
+                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} label={{ value: 'Risk %', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
                         <Tooltip
                           contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
                           formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
