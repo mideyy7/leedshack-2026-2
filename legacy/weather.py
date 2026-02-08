@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-df = pd.read_csv("delivery.csv")
+df = pd.read_csv("data/delivery.csv")
 
 """
 import re
@@ -62,7 +62,7 @@ fp = open("weather2.csv", "w")
 csv_wr = csv.writer(fp)
 
 csv_wr.writerow(
-    ("loc", "ts", "tempC", "humidity", "pressure", "windGustKmph"),
+    ("loc", "ts", "tempC", "humidity", "pressure", "windGustKmph", "precipMM", "weatherDescValue"),
 )
 
 API_URL = "https://api.worldweatheronline.com/premium/v1/past-weather.ashx"
@@ -84,7 +84,9 @@ def get_rows(loc, resp):
             dt = datetime.combine(date_part, time(hour=hrs))
 
             yield (
-                loc, dt, hr["tempC"], hr["humidity"], hr["pressure"], hr["WindGustKmph"],
+                loc, dt,
+                hr["tempC"], hr["humidity"], hr["pressure"], hr["WindGustKmph"],
+                hr["precipMM"], hr["weatherDesc"][0]["value"],
             )
 
 
