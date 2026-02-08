@@ -129,21 +129,32 @@ function App() {
     try {
       const response = await axios.get(`${API_BASE_URL}/graph/viz`);
       if (!response.data.error) {
-        setGraphData(response.data);
-        // Initialize node positions with circular layout on first load
-        if (response.data.nodes && Object.keys(nodePositions).length === 0) {
-          const nodes = response.data.nodes;
-          const uniqueLabels = [...new Set(nodes.map(n => n.label))];
-          const w = 800, h = 500, pad = 80;
+        // Only take the first 32 nodes as requested
+        const limitedNodes = response.data.nodes.slice(0, 32);
+        const nodeIds = limitedNodes.map(n => n.id);
+        
+        // Filter edges to only include those connecting our 32 nodes
+        const limitedEdges = response.data.edges.filter(
+          edge => nodeIds.includes(edge.source) && nodeIds.includes(edge.target)
+        );
+
+        setGraphData({ nodes: limitedNodes, edges: limitedEdges });
+
+        // Initialize node positions with a Spaced Grid Layout
+        if (limitedNodes.length > 0 && Object.keys(nodePositions).length === 0) {
+          const w = 800, h = 500;
+          const padding = 60;
+          const cols = 8; // 8x4 grid = 32 slots
           const positions = {};
-          nodes.forEach((node, i) => {
-            const idx = uniqueLabels.indexOf(node.label);
-            const angle = (2 * Math.PI * idx) / uniqueLabels.length;
-            const r = Math.min(w, h) / 2 - pad;
-            const jitter = (i % 3) * 18;
+
+          limitedNodes.forEach((node, i) => {
+            const row = Math.floor(i / cols);
+            const col = i % cols;
+            
+            // Calculate coordinates to fill the 800x500 space evenly
             positions[node.id] = {
-              x: w / 2 + (r - jitter) * Math.cos(angle),
-              y: h / 2 + (r - jitter) * Math.sin(angle),
+              x: padding + col * ((w - padding * 2) / (cols - 1)),
+              y: padding + row * ((h - padding * 2) / 3), // 3 because 4 rows have 3 gaps
             };
           });
           setNodePositions(positions);

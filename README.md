@@ -2,13 +2,17 @@
 
 A hackathon MVP that combines multivariate forecasting with a supply-chain digital twin. The goal is to turn historical logistics + weather data into predictive signals and actionable mitigation for operations teams.
 
-## Challenge Alignment (Parallax + Ligentia)
+## Challenge Alignment (Parallax + Ligentia + Solana)
 
 - **Parallax: Use the Past to Predict the Future**
 This project performs multivariate forecasting across shipment, route, and weather datasets to predict delays and risk. It focuses on correlations between multiple datasets and uses a learnable model to forecast outcomes from historical signals.
 
 - **Ligentia: The Great Supply Chain Race**
 Chain-Reaction provides early warning signals, simulation, and a shipment story view to move teams from reactive to predictive decision-making. It models a supply-chain graph, highlights risk at node and route level, and suggests mitigation paths.
+
+- **Solana: Best Use of Solana**
+The project uses the Solana Devnet to create an immutable audit trail. It records high-risk alerts, automated mitigation decisions, and human-readable "Journey Stories" as on-chain memos
+
 
 ## What It Does
 
