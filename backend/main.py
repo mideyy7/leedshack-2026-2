@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
 import networkx as nx
 import numpy as np
@@ -54,6 +55,11 @@ solana_client = None
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+
+
+class RetrainRequest(BaseModel):
+    start_date: str
+    end_date: str
 
 
 def load_shipments():
@@ -1098,4 +1104,105 @@ async def backtest_data():
         "mae": round(mae, 4),
         "test_size": len0_test,
         "train_size": len(df) - len0_test,
+    }
+
+
+@app.get("/data/date-range")
+async def data_date_range():
+    """Return the available date range in the shipment data."""
+    if shipments_df is None:
+        return {"error": "Shipments not loaded"}
+
+    ts = pd.to_datetime(shipments_df["od_start_time"], format="mixed", dayfirst=False, errors="coerce")
+    ts = ts.dropna()
+    if ts.empty:
+        return {"error": "No valid timestamps found"}
+
+    return {
+        "min_date": ts.min().strftime("%Y-%m-%d"),
+        "max_date": ts.max().strftime("%Y-%m-%d"),
+        "total_records": int(len(ts)),
+    }
+
+
+@app.post("/retrain-model")
+async def retrain_model(req: RetrainRequest):
+    """Retrain LightGBM models on a filtered date range, then re-run the full analysis pipeline."""
+    global risk_classifier, delay_regressor, model_meta
+    global predictions_cache, simulation_cache, mitigation_cache, story_cache, analysis_executed
+
+    if shipments_df is None:
+        return {"error": "Shipments not loaded"}
+
+    start = pd.to_datetime(req.start_date, errors="coerce")
+    end = pd.to_datetime(req.end_date, errors="coerce")
+
+    if pd.isna(start) or pd.isna(end):
+        return {"error": "Invalid date format"}
+    if start >= end:
+        return {"error": "start_date must be before end_date"}
+
+    print(f"Retraining model on date range {req.start_date} to {req.end_date}...")
+
+    df, weather_main_map = _build_feature_df()
+    mask = (df["od_start_time_parsed"] >= start) & (df["od_start_time_parsed"] <= end)
+    filtered = df[mask].copy()
+
+    if len(filtered) < 50:
+        return {"error": f"Too few records in range ({len(filtered)}). Need at least 50."}
+
+    train_df, test_df, cutoff_ts = _time_based_split(filtered, test_fraction=0.3)
+
+    if len(train_df) < 20:
+        return {"error": f"Training set too small ({len(train_df)}). Widen the date range."}
+
+    X_train = train_df[FEATURE_COLS].values
+    y_cls = train_df["is_delayed"].values
+    y_reg = train_df["delay_hours"].values
+
+    risk_classifier = lgb.LGBMClassifier(
+        n_estimators=100, max_depth=6, learning_rate=0.1,
+        num_leaves=31, verbose=-1, n_jobs=-1,
+    )
+    risk_classifier.fit(X_train, y_cls)
+
+    delay_regressor = lgb.LGBMRegressor(
+        n_estimators=100, max_depth=6, learning_rate=0.1,
+        num_leaves=31, verbose=-1, n_jobs=-1,
+    )
+    delay_regressor.fit(X_train, y_reg)
+
+    model_meta = {
+        "weather_main_map": weather_main_map,
+        "split_cutoff_ts": cutoff_ts,
+        "train_size": len(train_df),
+        "test_size": len(test_df),
+        "feature_cols": FEATURE_COLS,
+        "retrained": True,
+        "date_range": {"start": req.start_date, "end": req.end_date},
+    }
+
+    clf_path = os.path.join(MODEL_DIR, "classifier.pkl")
+    reg_path = os.path.join(MODEL_DIR, "regressor.pkl")
+    meta_path = os.path.join(MODEL_DIR, "meta.pkl")
+    joblib.dump(risk_classifier, clf_path)
+    joblib.dump(delay_regressor, reg_path)
+    joblib.dump(model_meta, meta_path)
+
+    compute_predictions()
+    run_simulations()
+    compute_mitigations()
+    generate_stories()
+    analysis_executed = True
+
+    print(f"Retrain complete. Train: {len(train_df)}, Test: {len(test_df)}")
+
+    return {
+        "status": "retrained",
+        "train_size": len(train_df),
+        "test_size": len(test_df),
+        "date_range": {"start": req.start_date, "end": req.end_date},
+        "total_filtered": len(filtered),
+        "delay_rate": round(float(y_cls.mean()), 4),
+        "mean_delay_hours": round(float(y_reg.mean()), 2),
     }

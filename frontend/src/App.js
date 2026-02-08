@@ -50,6 +50,13 @@ function App() {
   const [pipelineSummary, setPipelineSummary] = useState(null);
   const [pipelineCompletedAt, setPipelineCompletedAt] = useState(null);
 
+  // ─── Model Retraining ───
+  const [dateRange, setDateRange] = useState(null);
+  const [retrainStart, setRetrainStart] = useState('');
+  const [retrainEnd, setRetrainEnd] = useState('');
+  const [retrainLoading, setRetrainLoading] = useState(false);
+  const [retrainMeta, setRetrainMeta] = useState(null);
+
   // ─── Interactive Graph ───
   const [nodePositions, setNodePositions] = useState({});
   const [dragNode, setDragNode] = useState(null);
@@ -152,13 +159,25 @@ function App() {
     } catch (error) { console.error('Failed to fetch backtest:', error); }
   }, []);
 
-  // Fetch graph structure and backtest on startup (no analysis needed)
+  const fetchDateRange = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/data/date-range`);
+      if (!response.data.error) {
+        setDateRange(response.data);
+        setRetrainStart(response.data.min_date);
+        setRetrainEnd(response.data.max_date);
+      }
+    } catch (error) { console.error('Failed to fetch date range:', error); }
+  }, []);
+
+  // Fetch graph structure, backtest, and date range on startup
   useEffect(() => {
     if (apiStatus?.graph_loaded) {
       fetchGraphData();
       fetchBacktestData();
+      fetchDateRange();
     }
-  }, [apiStatus, fetchGraphData, fetchBacktestData]);
+  }, [apiStatus, fetchGraphData, fetchBacktestData, fetchDateRange]);
 
   // Fetch all analysis data after pipeline completes
   useEffect(() => {
@@ -218,6 +237,35 @@ function App() {
     }
 
     setPipelineRunning(false);
+  };
+
+  // ─── Model Retraining Handler ───
+  const handleRetrain = async () => {
+    setRetrainLoading(true);
+    setRetrainMeta(null);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/retrain-model`, {
+        start_date: retrainStart,
+        end_date: retrainEnd,
+      });
+      if (response.data.error) {
+        setRetrainMeta({ error: response.data.error });
+      } else {
+        setRetrainMeta(response.data);
+        setAnalysisRun(true);
+        setLastUpdate(0);
+        // Refresh all downstream data with the retrained model
+        fetchPredictions();
+        fetchSimulations();
+        fetchMitigations();
+        fetchStories();
+        fetchGraphData();
+        fetchBacktestData();
+      }
+    } catch (error) {
+      setRetrainMeta({ error: 'Failed to connect to backend' });
+    }
+    setRetrainLoading(false);
   };
 
   // ─── Interactive Graph: Drag & Pan Handlers ───
@@ -613,6 +661,79 @@ function App() {
                   <span className="backtest-metric-value">{backtestData.train_size.toLocaleString()}</span>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Model Training Date Range */}
+          {dateRange && (
+            <div className="panel retrain-panel" style={{ marginBottom: '1.5rem' }}>
+              <div className="panel-header">
+                <span className="panel-title">Model Training Window</span>
+                <span className="panel-badge">Date Selection</span>
+              </div>
+              <p className="chart-subtitle">
+                Select a historical date range to retrain the risk model. Narrowing the window
+                focuses the model on a specific period's patterns.
+              </p>
+              <div className="retrain-controls">
+                <div className="date-input-group">
+                  <label className="date-label">Start Date</label>
+                  <input
+                    type="date"
+                    className="date-input"
+                    value={retrainStart}
+                    min={dateRange.min_date}
+                    max={retrainEnd || dateRange.max_date}
+                    onChange={e => setRetrainStart(e.target.value)}
+                    disabled={retrainLoading}
+                  />
+                </div>
+                <div className="date-range-bar">
+                  <div className="date-range-track">
+                    <div
+                      className="date-range-fill"
+                      style={{
+                        left: `${((new Date(retrainStart) - new Date(dateRange.min_date)) / (new Date(dateRange.max_date) - new Date(dateRange.min_date))) * 100}%`,
+                        width: `${((new Date(retrainEnd) - new Date(retrainStart)) / (new Date(dateRange.max_date) - new Date(dateRange.min_date))) * 100}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="date-input-group">
+                  <label className="date-label">End Date</label>
+                  <input
+                    type="date"
+                    className="date-input"
+                    value={retrainEnd}
+                    min={retrainStart || dateRange.min_date}
+                    max={dateRange.max_date}
+                    onChange={e => setRetrainEnd(e.target.value)}
+                    disabled={retrainLoading}
+                  />
+                </div>
+                <button
+                  className={`retrain-btn ${retrainLoading ? 'loading' : ''}`}
+                  onClick={handleRetrain}
+                  disabled={retrainLoading || !retrainStart || !retrainEnd}
+                >
+                  {retrainLoading ? (
+                    <><span className="run-spinner" /> Retraining...</>
+                  ) : (
+                    'Retrain Model'
+                  )}
+                </button>
+              </div>
+              {retrainMeta && !retrainMeta.error && (
+                <div className="retrain-success">
+                  Model retrained on <strong>{retrainMeta.train_size.toLocaleString()}</strong> shipments
+                  ({retrainMeta.date_range.start} &rarr; {retrainMeta.date_range.end}).
+                  Delay rate: {(retrainMeta.delay_rate * 100).toFixed(1)}%,
+                  Mean delay: {retrainMeta.mean_delay_hours.toFixed(1)}h.
+                </div>
+              )}
+              {retrainMeta?.error && (
+                <div className="retrain-error">{retrainMeta.error}</div>
+              )}
             </div>
           )}
 
