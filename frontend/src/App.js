@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { BarChart, Bar, LineChart, Line, Legend, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import './App.css';
 
 const API_BASE_URL = 'http://localhost:8000';
@@ -40,6 +40,7 @@ function App() {
   const [mitigations, setMitigations] = useState(null);
   const [stories, setStories] = useState(null);
   const [graphData, setGraphData] = useState(null);
+  const [backtestData, setBacktestData] = useState(null);
 
   // ─── Pipeline Execution ───
   const [analysisRun, setAnalysisRun] = useState(false);
@@ -144,10 +145,20 @@ function App() {
     } catch (error) { console.error('Failed to fetch graph data:', error); }
   }, [nodePositions]);
 
-  // Fetch graph structure on startup (no analysis needed)
+  const fetchBacktestData = useCallback(async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/backtest`);
+      if (!response.data.error) setBacktestData(response.data);
+    } catch (error) { console.error('Failed to fetch backtest:', error); }
+  }, []);
+
+  // Fetch graph structure and backtest on startup (no analysis needed)
   useEffect(() => {
-    if (apiStatus?.graph_loaded) fetchGraphData();
-  }, [apiStatus, fetchGraphData]);
+    if (apiStatus?.graph_loaded) {
+      fetchGraphData();
+      fetchBacktestData();
+    }
+  }, [apiStatus, fetchGraphData, fetchBacktestData]);
 
   // Fetch all analysis data after pipeline completes
   useEffect(() => {
@@ -252,36 +263,6 @@ function App() {
     setPanStart(null);
   };
 
-  // ─── Non-passive wheel handler for smooth zoom (fixes scroll jank) ───
-  useEffect(() => {
-    const svg = svgRef.current;
-    if (!svg) return;
-
-    const onWheel = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
-      const pt = svg.createSVGPoint();
-      pt.x = e.clientX;
-      pt.y = e.clientY;
-      const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
-
-      setViewBox(prev => {
-        const nW = prev.w * zoomFactor;
-        const nH = prev.h * zoomFactor;
-        return {
-          x: svgP.x - (svgP.x - prev.x) * zoomFactor,
-          y: svgP.y - (svgP.y - prev.y) * zoomFactor,
-          w: Math.max(200, Math.min(2000, nW)),
-          h: Math.max(125, Math.min(1250, nH)),
-        };
-      });
-    };
-
-    svg.addEventListener('wheel', onWheel, { passive: false });
-    return () => svg.removeEventListener('wheel', onWheel);
-  }, [graphData]);
-
   // ─── Derived Data ───
 
   // Top 10 riskiest shipments for table
@@ -363,7 +344,7 @@ function App() {
         </defs>
 
         {/* Edges */}
-        {edges.slice(0, 150).map((edge, i) => {
+        {edges.slice(0, 50).map((edge, i) => {
           const src = nodePositions[edge.source];
           const tgt = nodePositions[edge.target];
           if (!src || !tgt) return null;
@@ -377,7 +358,7 @@ function App() {
         })}
 
         {/* Nodes */}
-        {nodes.slice(0, 80).map(node => {
+        {nodes.slice(0, 25).map(node => {
           const pos = nodePositions[node.id];
           if (!pos) return null;
           const r = getNodeRadius(node);
@@ -561,18 +542,94 @@ function App() {
             </div>
           </div>
 
+          {/* Model Validation: Actual vs Predicted (backtest chart) */}
+          {backtestData && (
+            <div className="panel" style={{ marginBottom: '1.5rem' }}>
+              <div className="panel-header">
+                <span className="panel-title">Model Validation — Actual vs Predicted</span>
+                <span className="panel-badge">LightGBM Backtest</span>
+              </div>
+              <p className="chart-subtitle">
+                Holdout test set ({backtestData.test_size.toLocaleString()} segments,{' '}
+                trained on {backtestData.train_size.toLocaleString()}). Model accuracy validates prediction reliability.
+              </p>
+              <ResponsiveContainer width="100%" height={280}>
+                <LineChart data={backtestData.points} margin={{ top: 10, right: 30, left: 20, bottom: 10 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.15)" />
+                  <XAxis
+                    dataKey="ts"
+                    tick={{ fill: '#c0c7d6', fontSize: 10, fontFamily: 'Space Mono' }}
+                    interval="preserveStartEnd"
+                  />
+                  <YAxis
+                    tick={{ fill: '#c0c7d6', fontSize: 11 }}
+                    label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#c0c7d6', fontSize: 12 }}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: 'rgba(20, 25, 32, 0.95)',
+                      border: '1px solid rgba(139,146,168,0.25)',
+                      borderRadius: 8,
+                      color: '#e6e9f0',
+                      padding: '0.75rem 1rem',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+                      fontFamily: 'Space Mono',
+                      fontSize: '0.75rem',
+                    }}
+                    labelStyle={{ color: '#e6e9f0', fontWeight: 600, marginBottom: 4 }}
+                    animationDuration={200}
+                    formatter={(value, name) => [
+                      `${value}h`,
+                      name === 'actual' ? 'Actual Delay' : 'Predicted Delay',
+                    ]}
+                  />
+                  <Legend
+                    wrapperStyle={{ color: '#c0c7d6', fontSize: '0.75rem', fontFamily: 'Space Mono' }}
+                  />
+                  <Line
+                    type="monotone" dataKey="actual" stroke="#3b82f6"
+                    strokeWidth={2} dot={false} name="Actual Delay"
+                  />
+                  <Line
+                    type="monotone" dataKey="predicted" stroke="#00ff88"
+                    strokeWidth={2} dot={false} name="Predicted Delay"
+                    strokeDasharray="6 3"
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="backtest-metrics">
+                <div className="backtest-metric">
+                  <span className="backtest-metric-label">RMSE</span>
+                  <span className="backtest-metric-value">{backtestData.rmse.toFixed(2)}h</span>
+                </div>
+                <div className="backtest-metric">
+                  <span className="backtest-metric-label">MAE</span>
+                  <span className="backtest-metric-value">{backtestData.mae.toFixed(2)}h</span>
+                </div>
+                <div className="backtest-metric">
+                  <span className="backtest-metric-label">Test Set</span>
+                  <span className="backtest-metric-value">{backtestData.test_size.toLocaleString()}</span>
+                </div>
+                <div className="backtest-metric">
+                  <span className="backtest-metric-label">Train Set</span>
+                  <span className="backtest-metric-value">{backtestData.train_size.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Interactive supply chain graph */}
           <div className="panel" style={{ marginBottom: '1.5rem' }}>
             <div className="panel-header">
               <span className="panel-title">Supply Chain Network</span>
               <span className="panel-badge">
-                {analysisRun ? 'Risk-Colored' : 'Interactive — Drag, Scroll to Zoom'}
+                {analysisRun ? 'Risk-Colored' : 'Interactive — Drag to Explore'}
               </span>
             </div>
             <p className="chart-subtitle">
               {analysisRun
                 ? 'Green = safe, Yellow = warning, Red = critical. Drag to rearrange.'
-                : 'Explore the digital twin. Drag nodes to rearrange. Scroll to zoom.'}
+                : 'Explore the digital twin. Drag nodes to rearrange.'}
             </p>
             {renderInteractiveGraph()}
           </div>
@@ -674,15 +731,36 @@ function App() {
                     <p className="chart-subtitle">Simulated delay outcomes for the most volatile shipment</p>
                     <ResponsiveContainer width="100%" height={300}>
                       <BarChart data={singleSimData} margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
-                        <XAxis dataKey="name" tick={{ fill: '#8b92a8', fontSize: 12 }} />
-                        <YAxis tick={{ fill: '#8b92a8' }}
-                          label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
-                        <Tooltip
-                          contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                          formatter={value => [`${value}h`]}
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.15)" />
+                        <XAxis
+                          dataKey="name"
+                          tick={{ fill: '#c0c7d6', fontSize: 13, fontWeight: 600, fontFamily: 'Space Mono' }}
+                          axisLine={{ stroke: 'rgba(139,146,168,0.2)' }}
+                          tickLine={false}
                         />
-                        <Bar dataKey="delay" radius={[4, 4, 0, 0]}>
+                        <YAxis
+                          tick={{ fill: '#c0c7d6', fontSize: 12 }}
+                          label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#c0c7d6', fontSize: 12 }}
+                          axisLine={{ stroke: 'rgba(139,146,168,0.2)' }}
+                          tickLine={false}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            background: 'rgba(20, 25, 32, 0.95)',
+                            border: '1px solid rgba(139,146,168,0.25)',
+                            borderRadius: 8,
+                            color: '#e6e9f0',
+                            padding: '0.75rem 1rem',
+                            boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+                            fontFamily: 'Space Mono',
+                            fontSize: '0.8rem',
+                          }}
+                          labelStyle={{ color: '#e6e9f0', fontWeight: 700, marginBottom: 6, fontSize: '0.85rem' }}
+                          cursor={{ fill: 'rgba(255,255,255,0.04)', radius: 4 }}
+                          animationDuration={200}
+                          formatter={(value, name) => [`${value} hours`, 'Simulated Delay']}
+                        />
+                        <Bar dataKey="delay" radius={[6, 6, 0, 0]} animationDuration={600}>
                           {singleSimData.map((entry, idx) => (
                             <Cell key={idx} fill={entry.fill} />
                           ))}

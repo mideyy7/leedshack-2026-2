@@ -984,3 +984,51 @@ async def risk_stats():
         "models_loaded": risk_classifier is not None and delay_regressor is not None,
         "top_5_riskiest": top_5,
     }
+
+
+@app.get("/backtest")
+async def backtest_data():
+    """Return actual vs predicted delay for model validation visualization."""
+    if delay_regressor is None or shipments_df is None:
+        return {"error": "Model or data not loaded"}
+
+    df, _ = _build_feature_df()
+    X = df[FEATURE_COLS].values
+
+    pred = delay_regressor.predict(X)
+    df["predicted_delay"] = np.clip(pred, 0, None)
+
+    # Sort by timestamp
+    df = df.sort_values("od_start_time_parsed").dropna(subset=["od_start_time_parsed"])
+
+    # Use last 30% as "test" for backtest visualization
+    split_idx = int(len(df) * 0.7)
+    test = df.iloc[split_idx:].copy()
+
+    # Downsample to ~150 points for rendering
+    n = min(150, len(test))
+    if len(test) > n:
+        sample_idx = np.linspace(0, len(test) - 1, n).astype(int)
+        test = test.iloc[sample_idx]
+
+    points = []
+    for _, row in test.iterrows():
+        points.append({
+            "ts": row["od_start_time_parsed"].strftime("%b %d"),
+            "actual": round(float(row["delay_hours"]), 2),
+            "predicted": round(float(row["predicted_delay"]), 2),
+        })
+
+    actual_arr = test["delay_hours"].values
+    pred_arr = test["predicted_delay"].values
+    err = actual_arr - pred_arr
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae = float(np.mean(np.abs(err)))
+
+    return {
+        "points": points,
+        "rmse": round(rmse, 4),
+        "mae": round(mae, 4),
+        "test_size": int(len(test)),
+        "train_size": split_idx,
+    }
