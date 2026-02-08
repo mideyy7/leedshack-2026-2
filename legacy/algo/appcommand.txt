@@ -1,0 +1,2 @@
+#use this command to run the code
+python3 algo.py --train_csv ../data/delivery.csv --input_csv ../data/delivery.csv --weather_csv ../data/weather2.csv --out_jsonl out.jsonl

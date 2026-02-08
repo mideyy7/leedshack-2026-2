@@ -1,0 +1,5 @@
+fastapi[all]==0.100.0
+uvicorn[standard]==0.24.0
+motor==3.7.1
+python-dotenv==1.0.0
+pydantic==2.5.1

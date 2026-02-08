@@ -1,0 +1,5 @@
+{"confidence": 0.9999990000010001, "shipment_id": "x1", "ts": "2026-02-07T08:30:00Z", "p_late": 1.0, "e_delay": 10.0, "e_time": 120.0}
+{"confidence": 0.9999990000010001, "shipment_id": "x2", "ts": "2026-02-07T09:45:00Z", "p_late": 1.0, "e_delay": 25.0, "e_time": 120.0}
+{"confidence": 0.9999990000010001, "shipment_id": "x3", "ts": "2026-02-07T11:20:00Z", "p_late": 1.0, "e_delay": 25.0, "e_time": 120.0}
+{"confidence": 0.9999990000010001, "shipment_id": "x4", "ts": "2026-02-07T14:00:00Z", "p_late": 1.0, "e_delay": 25.0, "e_time": 120.0}
+{"confidence": 0.9999990000010001, "shipment_id": "x5", "ts": "2026-02-07T15:30:00Z", "p_late": 1.0, "e_delay": 25.0, "e_time": 120.0}

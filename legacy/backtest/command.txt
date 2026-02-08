@@ -1,0 +1,1 @@
+python3 backtest.py --delivery_csv ../data/delivery.csv --weather_csv ../data/weather2.csv --cutoff_ts 2018-09-30
