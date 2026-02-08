@@ -326,7 +326,7 @@ def train_models():
 
     # Time-based split to avoid leakage across time
     train_df, test_df, cutoff_ts = _time_based_split(df, test_fraction=0.3)
-    X_train = train_df[FEATURE_COLS].values
+    X_train = train_df[FEATURE_COLS]
     y_cls = train_df["is_delayed"].values
     y_reg = train_df["delay_hours"].values
 
@@ -371,7 +371,7 @@ def compute_predictions():
         return
 
     df, _ = _build_feature_df()
-    X = df[FEATURE_COLS].values
+    X = df[FEATURE_COLS]
 
     # 1. Get Raw Probabilities & Delays
     raw_risk_probs = risk_classifier.predict_proba(X)[:, 1]
@@ -460,7 +460,8 @@ def run_simulations():
             noise = rng.normal(1.0, noise_scale, size=len(df))
             X_sim[:, ci] = X_base[:, ci] * noise
 
-        preds = delay_regressor.predict(X_sim)
+        X_sim_df = pd.DataFrame(X_sim, columns=FEATURE_COLS)
+        preds = delay_regressor.predict(X_sim_df)
         all_delays[:, sim] = np.clip(preds, 0, None)
 
     # Aggregate per trip_uuid
@@ -1065,7 +1066,7 @@ async def backtest_data():
     else:
         test = df[df["od_start_time_parsed"] >= split_cutoff].copy()
 
-    X_test = test[FEATURE_COLS].values
+    X_test = test[FEATURE_COLS]
     pred = delay_regressor.predict(X_test)
     test["predicted_delay"] = np.clip(pred, 0, None)
 
