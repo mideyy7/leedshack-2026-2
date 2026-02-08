@@ -4,6 +4,9 @@
   "private": true,
   "dependencies": {
     "axios": "^1.13.4",
+    "d3": "^7.9.0",
+    "d3-selection": "^3.0.0",
+    "d3-zoom": "^3.0.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-scripts": "5.0.1",
