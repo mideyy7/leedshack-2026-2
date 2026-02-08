@@ -31,6 +31,28 @@ The project uses the Solana Devnet to create an immutable audit trail. It record
 
 ## Quick Start
 
+### TL;DR (Demo)
+
+```bash
+# Terminal 1
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+
+# Terminal 2
+cd frontend
+npm install
+npm start
+```
+
+Then warm up the backend (one-time per run):
+
+```bash
+curl -X POST http://localhost:8000/run-analysis
+```
+
 ### 1. Backend
 
 ```bash
