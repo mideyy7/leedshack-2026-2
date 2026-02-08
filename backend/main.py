@@ -35,6 +35,7 @@ weather_loc_avg = None
 weather_global_avg = None
 risk_classifier = None
 delay_regressor = None
+model_meta = None  # stores split info + feature metadata
 predictions_cache = None  # dict of trip_uuid -> {risk, expected_delay_hours}
 simulation_cache = None   # dict of trip_uuid -> {best_case, worst_case, expected_delay_hours, p10, p90}
 mitigation_cache = None   # dict of trip_uuid -> {strategy, expected_risk_reduction, solana_tx}
@@ -192,9 +193,10 @@ def load_weather():
 
 # --- Phase 4: Feature engineering & LightGBM training ---
 
+# NOTE: Exclude leakage features derived from actual outcomes (e.g., factor/segment_factor).
 FEATURE_COLS = [
     "osrm_time", "actual_distance_to_destination", "segment_osrm_time",
-    "segment_osrm_distance", "factor", "segment_factor",
+    "segment_osrm_distance",
     "temperature", "humidity", "wind_speed", "rain_1h", "snow_1h",
     "route_type_encoded", "weather_main_encoded",
     "hour_of_day", "day_of_week", "is_peak_hour",
@@ -289,9 +291,21 @@ def _build_feature_df():
 
     return df, weather_main_map
 
+def _time_based_split(df, test_fraction=0.3):
+    """Return (train_df, test_df, cutoff_ts)."""
+    df = df.sort_values("od_start_time_parsed").dropna(subset=["od_start_time_parsed"])
+    if len(df) == 0:
+        return df, df, None
+    split_idx = int(len(df) * (1 - test_fraction))
+    cutoff_ts = df.iloc[split_idx]["od_start_time_parsed"]
+    train = df.iloc[:split_idx].copy()
+    test = df.iloc[split_idx:].copy()
+    return train, test, cutoff_ts
+
+
 def train_models():
     """Train LightGBM classifier and regressor, save to disk."""
-    global risk_classifier, delay_regressor
+    global risk_classifier, delay_regressor, model_meta
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     clf_path = os.path.join(MODEL_DIR, "classifier.pkl")
@@ -302,36 +316,51 @@ def train_models():
     if os.path.exists(clf_path) and os.path.exists(reg_path):
         risk_classifier = joblib.load(clf_path)
         delay_regressor = joblib.load(reg_path)
+        if os.path.exists(meta_path):
+            model_meta = joblib.load(meta_path)
         print("Loaded existing models from disk")
         return
 
     print("Training LightGBM models...")
     df, weather_main_map = _build_feature_df()
 
-    X = df[FEATURE_COLS].values
-    y_cls = df["is_delayed"].values
-    y_reg = df["delay_hours"].values
+    # Time-based split to avoid leakage across time
+    train_df, test_df, cutoff_ts = _time_based_split(df, test_fraction=0.3)
+    X_train = train_df[FEATURE_COLS].values
+    y_cls = train_df["is_delayed"].values
+    y_reg = train_df["delay_hours"].values
 
     # Train classifier
     risk_classifier = lgb.LGBMClassifier(
         n_estimators=100, max_depth=6, learning_rate=0.1,
         num_leaves=31, verbose=-1, n_jobs=-1,
     )
-    risk_classifier.fit(X, y_cls)
+    risk_classifier.fit(X_train, y_cls)
 
     # Train regressor
     delay_regressor = lgb.LGBMRegressor(
         n_estimators=100, max_depth=6, learning_rate=0.1,
         num_leaves=31, verbose=-1, n_jobs=-1,
     )
-    delay_regressor.fit(X, y_reg)
+    delay_regressor.fit(X_train, y_reg)
 
     # Save models and metadata
     joblib.dump(risk_classifier, clf_path)
     joblib.dump(delay_regressor, reg_path)
-    joblib.dump({"weather_main_map": weather_main_map}, meta_path)
+    model_meta = {
+        "weather_main_map": weather_main_map,
+        "split_cutoff_ts": cutoff_ts,
+        "train_size": len(train_df),
+        "test_size": len(test_df),
+        "feature_cols": FEATURE_COLS,
+    }
+    joblib.dump(model_meta, meta_path)
 
-    print(f"Models trained and saved. Delay rate: {y_cls.mean():.2%}, Mean delay: {y_reg.mean():.1f}h")
+    print(
+        f"Models trained and saved. "
+        f"Delay rate: {y_cls.mean():.2%}, Mean delay: {y_reg.mean():.1f}h, "
+        f"Train/Test: {len(train_df)}/{len(test_df)}"
+    )
 
 def compute_predictions():
     """Run predictions for all shipments and cache results."""
@@ -1025,17 +1054,20 @@ async def backtest_data():
         return {"error": "Model or data not loaded"}
 
     df, _ = _build_feature_df()
-    X = df[FEATURE_COLS].values
+    # Ensure consistent time-based split with training
+    split_cutoff = None
+    if model_meta and "split_cutoff_ts" in model_meta:
+        split_cutoff = model_meta["split_cutoff_ts"]
 
-    pred = delay_regressor.predict(X)
-    df["predicted_delay"] = np.clip(pred, 0, None)
-
-    # Sort by timestamp
     df = df.sort_values("od_start_time_parsed").dropna(subset=["od_start_time_parsed"])
+    if split_cutoff is None:
+        _, test, split_cutoff = _time_based_split(df, test_fraction=0.3)
+    else:
+        test = df[df["od_start_time_parsed"] >= split_cutoff].copy()
 
-    # Use last 30% as "test" for backtest visualization
-    split_idx = int(len(df) * 0.7)
-    test = df.iloc[split_idx:].copy()
+    X_test = test[FEATURE_COLS].values
+    pred = delay_regressor.predict(X_test)
+    test["predicted_delay"] = np.clip(pred, 0, None)
 
     len0_test = len(test)
 
@@ -1064,5 +1096,5 @@ async def backtest_data():
         "rmse": round(rmse, 4),
         "mae": round(mae, 4),
         "test_size": len0_test,
-        "train_size": split_idx,
+        "train_size": len(df) - len0_test,
     }
