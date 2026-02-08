@@ -127,18 +127,14 @@ def load_weather():
         print("WARNING: Graph not built yet, skipping weather merge")
         return
 
-    # Filter to Indian weather stations (shipments are India-based)
-    india_weather = weather_df[weather_df["country"] == "IN"].copy()
-    india_weather["name_lower"] = india_weather["name"].str.lower()
+    # weather2.csv uses loc+ts; aggregate by location (state/region)
+    weather_df["loc_lower"] = weather_df["loc"].astype(str).str.strip().str.lower()
 
-    # Build lookup: lowercase city name -> average weather row
-    city_weather = india_weather.groupby("name_lower").agg(
-        temperature=("temperature", "mean"),
+    loc_weather = weather_df.groupby("loc_lower").agg(
+        tempC=("tempC", "mean"),
         humidity=("humidity", "mean"),
-        wind_speed=("wind_speed", "mean"),
-        rain_1h=("rain_1h", "mean"),
-        snow_1h=("snow_1h", "mean"),
-        weather_main=("weather_main", "first"),
+        pressure=("pressure", "mean"),
+        windGustKmph=("windGustKmph", "mean"),
     )
 
     # Build state-level fallback averages
@@ -148,54 +144,34 @@ def load_weather():
         if state:
             node_states.setdefault(state, []).append(node)
 
-    # Country-wide fallback
+    # Global fallback (mean across all locations)
     india_avg = {
-        "temperature": float(india_weather["temperature"].mean()),
-        "humidity": float(india_weather["humidity"].mean()),
-        "wind_speed": float(india_weather["wind_speed"].mean()),
-        "rain_1h": float(india_weather["rain_1h"].mean()),
-        "snow_1h": float(india_weather["snow_1h"].mean()),
-        "weather_main": "Clouds",
+        "tempC": float(weather_df["tempC"].mean()),
+        "humidity": float(weather_df["humidity"].mean()),
+        "pressure": float(weather_df["pressure"].mean()),
+        "windGustKmph": float(weather_df["windGustKmph"].mean()),
     }
 
-    matched_exact, matched_state, matched_fallback = 0, 0, 0
+    matched_state, matched_fallback = 0, 0
 
     for node in graph.nodes:
-        city = _extract_city(node)
-
-        # Strategy 1: exact city name match
-        if city in city_weather.index:
-            row = city_weather.loc[city]
+        # Strategy 1: match by state/region (loc)
+        state = _extract_state(node)
+        state_key = state.strip().lower() if state else None
+        if state_key and state_key in loc_weather.index:
+            row = loc_weather.loc[state_key]
             for attr in WEATHER_ATTRS:
                 val = row[attr]
-                graph.nodes[node][attr] = round(float(val), 2) if attr != "weather_main" else str(val)
-            matched_exact += 1
+                graph.nodes[node][attr] = round(float(val), 2)
+            matched_state += 1
             continue
 
-        # Strategy 2: pick any matched node from same state
-        state = _extract_state(node)
-        assigned = False
-        if state and state in node_states:
-            for sibling in node_states[state]:
-                sib_city = _extract_city(sibling)
-                if sib_city in city_weather.index:
-                    row = city_weather.loc[sib_city]
-                    for attr in WEATHER_ATTRS:
-                        val = row[attr]
-                        graph.nodes[node][attr] = round(float(val), 2) if attr != "weather_main" else str(val)
-                    assigned = True
-                    matched_state += 1
-                    break
-
-        if assigned:
-            continue
-
-        # Strategy 3: India-wide average fallback
+        # Strategy 2: global average fallback
         for attr in WEATHER_ATTRS:
-            graph.nodes[node][attr] = india_avg[attr] if attr != "weather_main" else india_avg["weather_main"]
+            graph.nodes[node][attr] = round(float(india_avg[attr]), 2)
         matched_fallback += 1
 
-    print(f"Weather merged: {matched_exact} exact, {matched_state} state-level, {matched_fallback} fallback")
+    print(f"Weather merged: {matched_state} state-level, {matched_fallback} fallback")
 
 
 # --- Phase 4: Feature engineering & LightGBM training ---
