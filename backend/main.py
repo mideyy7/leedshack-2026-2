@@ -35,6 +35,7 @@ predictions_cache = None  # dict of trip_uuid -> {risk, expected_delay_hours}
 simulation_cache = None   # dict of trip_uuid -> {best_case, worst_case, expected_delay_hours, p10, p90}
 mitigation_cache = None   # dict of trip_uuid -> {strategy, expected_risk_reduction, solana_tx}
 story_cache = None        # dict of trip_uuid -> {story, previous_state, current_state, risk, ...}
+analysis_executed = False  # True after /run-analysis has been called
 
 # Solana config
 SOLANA_RPC_URL = "https://api.devnet.solana.com"
@@ -639,15 +640,12 @@ def generate_stories():
 
 @app.on_event("startup")
 async def startup_event():
-    """Load data on startup."""
+    """Load data, build graph, and load models on startup. No inference runs here."""
     print("Starting up Chain-Reaction API...")
     load_shipments()
     load_weather()
     train_models()
-    compute_predictions()
-    run_simulations()
-    compute_mitigations()
-    generate_stories()
+    print("Startup complete. Awaiting /run-analysis to execute pipeline.")
 
 
 @app.get("/")
@@ -666,6 +664,40 @@ async def health_check():
         "graph_loaded": graph is not None,
         "shipments_loaded": shipments_df is not None,
         "weather_loaded": weather_df is not None,
+        "analysis_executed": analysis_executed,
+    }
+
+
+@app.post("/run-analysis")
+async def run_analysis():
+    """Execute the full analysis pipeline: predict, simulate, mitigate, generate stories."""
+    global analysis_executed
+
+    if graph is None or shipments_df is None:
+        return {"error": "Data not loaded. Cannot run analysis."}
+    if risk_classifier is None or delay_regressor is None:
+        return {"error": "Models not loaded. Cannot run analysis."}
+
+    print("Running full analysis pipeline...")
+
+    compute_predictions()
+    run_simulations()
+    compute_mitigations()
+    generate_stories()
+
+    analysis_executed = True
+
+    high_risk = sum(1 for v in predictions_cache.values() if v["risk"] > 0.7) if predictions_cache else 0
+    total = len(predictions_cache) if predictions_cache else 0
+
+    print("Analysis pipeline complete.")
+    return {
+        "status": "complete",
+        "total_trips": total,
+        "high_risk_trips": high_risk,
+        "simulations_run": len(simulation_cache) if simulation_cache else 0,
+        "mitigations_computed": len(mitigation_cache) if mitigation_cache else 0,
+        "stories_generated": len(story_cache) if story_cache else 0,
     }
 
 
@@ -757,13 +789,16 @@ async def get_stories():
 
 @app.get("/graph/viz")
 async def graph_viz():
-    """Return graph nodes and edges with risk coloring for network visualization (Phase 9)."""
+    """Return graph nodes and edges for network visualization.
+    Before analysis: neutral colors showing structure only.
+    After analysis: risk-colored nodes and edges.
+    """
     if graph is None:
         return {"error": "Graph not loaded"}
 
-    # Build node risk from predictions: aggregate avg risk per location
+    # Build node risk from predictions (only if analysis has run)
     node_risk = {}
-    if predictions_cache and shipments_df is not None:
+    if analysis_executed and predictions_cache and shipments_df is not None:
         df = shipments_df.copy()
         df["risk"] = df["trip_uuid"].map(
             lambda uid: predictions_cache.get(uid, {}).get("risk", 0)
@@ -773,30 +808,54 @@ async def graph_viz():
             for name, risk in agg.items():
                 node_risk[name] = max(node_risk.get(name, 0), float(risk))
 
+    # Determine node type from name patterns
+    def _node_type(name):
+        lower = name.lower()
+        if "port" in lower or "harbour" in lower:
+            return "port"
+        if "warehouse" in lower or "wh" in lower or "distribution" in lower:
+            return "warehouse"
+        if "hub" in lower or "central" in lower:
+            return "hub"
+        return "supplier"
+
     nodes = []
     for name in graph.nodes:
+        state = graph.nodes[name].get("state", "on-time")
         risk = node_risk.get(name, 0)
+        if analysis_executed:
+            color = "#ff3864" if risk > 0.7 else "#ffd700" if risk > 0.4 else "#00ff88"
+        else:
+            color = "#3b82f6"  # neutral blue before analysis
+
         nodes.append({
             "id": name,
             "label": name.split("(")[0].strip().split("_")[0],
             "risk": round(risk, 4),
-            "color": "#ff3864" if risk > 0.7 else "#ffd700" if risk > 0.4 else "#00ff88",
+            "state": state,
+            "type": _node_type(name),
+            "color": color,
         })
 
     edges = []
     for src, dst, attrs in graph.edges(data=True):
-        src_risk = node_risk.get(src, 0)
-        dst_risk = node_risk.get(dst, 0)
-        edge_risk = max(src_risk, dst_risk)
+        if analysis_executed:
+            src_risk = node_risk.get(src, 0)
+            dst_risk = node_risk.get(dst, 0)
+            edge_risk = max(src_risk, dst_risk)
+            edge_color = "#ff3864" if edge_risk > 0.7 else "#ffd700" if edge_risk > 0.4 else "#00ff88"
+        else:
+            edge_color = "rgba(59,130,246,0.4)"  # neutral blue before analysis
+
         edges.append({
             "source": src,
             "target": dst,
             "transit_time": attrs.get("transit_time", 0),
             "distance": attrs.get("distance", 0),
-            "color": "#ff3864" if edge_risk > 0.7 else "#ffd700" if edge_risk > 0.4 else "#00ff88",
+            "color": edge_color,
         })
 
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "analysis_executed": analysis_executed}
 
 
 @app.get("/risk/stats")
