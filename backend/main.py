@@ -416,7 +416,7 @@ def compute_predictions():
     # Add stochastic noise (Jitter) for simulation realism
     rng = np.random.default_rng(42)
     noise = rng.normal(0, 0.03, size=len(trip_preds)) # Small 3% jitter
-    trip_preds["risk"] = (trip_preds["risk"] + noise).clip(0.01, 0.99)
+    trip_preds["risk"] = (trip_preds["risk"] + noise).clip(0.0, 1.0)
 
     predictions_cache = {
         uid: {
