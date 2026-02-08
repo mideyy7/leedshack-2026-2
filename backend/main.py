@@ -31,6 +31,8 @@ app.add_middleware(
 graph = None
 shipments_df = None
 weather_df = None
+weather_loc_avg = None
+weather_global_avg = None
 risk_classifier = None
 delay_regressor = None
 predictions_cache = None  # dict of trip_uuid -> {risk, expected_delay_hours}
@@ -108,67 +110,78 @@ def _extract_state(node_name):
     return match.group(1) if match else None
 
 
-WEATHER_ATTRS = ["tempC", "humidity", "pressure", "windGustKmph"]  # "rain_1h", "snow_1h"]
+WEATHER_ATTRS = ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]
 
 
 def load_weather():
-    """Load weather CSV and merge weather attributes onto graph nodes."""
-    global weather_df
+    """Load weather2 CSV and merge weather attributes onto graph nodes (state-level averages)."""
+    global weather_df, weather_loc_avg, weather_global_avg
 
     csv_path = os.path.join(DATA_DIR, "weather2.csv")
     if not os.path.exists(csv_path):
         print("WARNING: weather2.csv not found at", csv_path)
         return
 
-    weather_df = pd.read_csv(csv_path, low_memory=False)
-    print(f"Loaded {len(weather_df)} weather records")
+    raw = pd.read_csv(csv_path, low_memory=False)
+    print(f"Loaded {len(raw)} weather records")
+
+    raw["ts"] = pd.to_datetime(raw["ts"], errors="coerce")
+    raw["loc"] = raw["loc"].astype(str).str.strip()
+    raw = raw.dropna(subset=["loc", "ts"])
+
+    # Normalize schema to the expected weather feature names
+    weather_df = raw.groupby(["loc", "ts"]).agg(
+        temperature=("tempC", "mean"),
+        humidity=("humidity", "mean"),
+        wind_speed=("windGustKmph", "mean"),
+        rain_1h=("precipMM", "mean"),
+        weather_main=("weatherDescValue", lambda s: s.dropna().iloc[0] if len(s.dropna()) else "Clear"),
+    ).reset_index()
+    weather_df["snow_1h"] = 0.0
+
+    # Precompute location and global averages for fallback during merges
+    weather_loc_avg = weather_df.groupby("loc").agg(
+        temperature=("temperature", "mean"),
+        humidity=("humidity", "mean"),
+        wind_speed=("wind_speed", "mean"),
+        rain_1h=("rain_1h", "mean"),
+        weather_main=("weather_main", lambda s: s.mode().iloc[0] if len(s.mode()) else "Clear"),
+    ).reset_index()
+    weather_loc_avg["snow_1h"] = 0.0
+
+    weather_global_avg = {
+        "temperature": float(weather_df["temperature"].mean()),
+        "humidity": float(weather_df["humidity"].mean()),
+        "wind_speed": float(weather_df["wind_speed"].mean()),
+        "rain_1h": float(weather_df["rain_1h"].mean()),
+        "snow_1h": 0.0,
+        "weather_main": "Clear",
+    }
 
     if graph is None:
         print("WARNING: Graph not built yet, skipping weather merge")
         return
 
-    # weather2.csv uses loc+ts; aggregate by location (state/region)
-    weather_df["loc_lower"] = weather_df["loc"].astype(str).str.strip().str.lower()
-
-    loc_weather = weather_df.groupby("loc_lower").agg(
-        tempC=("tempC", "mean"),
-        humidity=("humidity", "mean"),
-        pressure=("pressure", "mean"),
-        windGustKmph=("windGustKmph", "mean"),
-    )
-
-    # Build state-level fallback averages
-    node_states = {}
-    for node in graph.nodes:
-        state = _extract_state(node)
-        if state:
-            node_states.setdefault(state, []).append(node)
-
-    # Global fallback (mean across all locations)
-    india_avg = {
-        "tempC": float(weather_df["tempC"].mean()),
-        "humidity": float(weather_df["humidity"].mean()),
-        "pressure": float(weather_df["pressure"].mean()),
-        "windGustKmph": float(weather_df["windGustKmph"].mean()),
-    }
-
+    # Merge state-level averages onto graph nodes
+    node_states = {node: _extract_state(node) for node in graph.nodes}
     matched_state, matched_fallback = 0, 0
 
+    loc_avg_lookup = {
+        row["loc"]: row for _, row in weather_loc_avg.iterrows()
+    }
+
     for node in graph.nodes:
-        # Strategy 1: match by state/region (loc)
-        state = _extract_state(node)
-        state_key = state.strip().lower() if state else None
-        if state_key and state_key in loc_weather.index:
-            row = loc_weather.loc[state_key]
+        state = node_states.get(node)
+        if state and state in loc_avg_lookup:
+            row = loc_avg_lookup[state]
             for attr in WEATHER_ATTRS:
                 val = row[attr]
-                graph.nodes[node][attr] = round(float(val), 2)
+                graph.nodes[node][attr] = round(float(val), 2) if attr != "weather_main" else str(val)
             matched_state += 1
             continue
 
-        # Strategy 2: global average fallback
         for attr in WEATHER_ATTRS:
-            graph.nodes[node][attr] = round(float(india_avg[attr]), 2)
+            graph.nodes[node][attr] = weather_global_avg[attr] if attr != "weather_main" else weather_global_avg["weather_main"]
         matched_fallback += 1
 
     print(f"Weather merged: {matched_state} state-level, {matched_fallback} fallback")
@@ -184,8 +197,55 @@ FEATURE_COLS = [
     "hour_of_day", "day_of_week", "is_peak_hour",
 ]
 
+def _nearest_3h_bucket_minutes(minute_of_day):
+    """Round to nearest 3-hour bucket (00, 03, ..., 21) without crossing day boundaries."""
+    bucket = ((minute_of_day + 89) // 180) * 180
+    return bucket.clip(lower=0, upper=21 * 60)
+
+def _attach_weather_for_shipments(df):
+    """Attach weather2 features to shipment rows using closest 3-hour bucket."""
+    if weather_df is None or weather_df.empty:
+        for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
+            df[col] = 0.0
+        df["weather_main"] = "Clear"
+        return df
+
+    df["source_state"] = df["source_name"].map(_extract_state)
+
+    minute_of_day = (df["od_start_time_parsed"].dt.hour * 60 + df["od_start_time_parsed"].dt.minute)
+    minute_of_day = minute_of_day.fillna(12 * 60).astype(int)
+    bucket_minutes = _nearest_3h_bucket_minutes(minute_of_day)
+    bucket_hours = (bucket_minutes // 60).astype(int)
+
+    default_date = weather_df["ts"].min().normalize()
+    date_base = df["od_start_time_parsed"].dt.normalize().fillna(default_date)
+    df["weather_ts"] = date_base + pd.to_timedelta(bucket_hours, unit="h")
+
+    weather_cols = ["loc", "ts", "temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]
+    df = df.merge(
+        weather_df[weather_cols],
+        how="left",
+        left_on=["source_state", "weather_ts"],
+        right_on=["loc", "ts"],
+    ).drop(columns=["loc", "ts"], errors="ignore")
+
+    # Fallback to state averages when exact time match is missing
+    if weather_loc_avg is not None and not weather_loc_avg.empty:
+        loc_avg = weather_loc_avg.set_index("loc")
+        for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
+            df[col] = df[col].fillna(df["source_state"].map(loc_avg[col]))
+        df["weather_main"] = df["weather_main"].fillna(df["source_state"].map(loc_avg["weather_main"]))
+
+    # Global fallback
+    if weather_global_avg:
+        for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
+            df[col] = df[col].fillna(weather_global_avg[col])
+        df["weather_main"] = df["weather_main"].fillna(weather_global_avg["weather_main"])
+
+    return df
+
 def _build_feature_df():
-    """Build a feature DataFrame by merging shipment rows with graph weather attributes."""
+    """Build a feature DataFrame by merging shipment rows with weather2.csv attributes."""
     df = shipments_df.copy()
 
     # Parse temporal features from od_start_time
@@ -198,28 +258,18 @@ def _build_feature_df():
     route_map = {rt: i for i, rt in enumerate(df["route_type"].dropna().unique())}
     df["route_type_encoded"] = df["route_type"].map(route_map).fillna(0).astype(int)
 
-    # Merge weather from source node
-    weather_lookup = {}
-    if graph is not None:
-        for node, attrs in graph.nodes(data=True):
-            if "temperature" in attrs:
-                weather_lookup[node] = {k: attrs[k] for k in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]}
+    # Merge weather from weather2.csv using closest 3-hour bucket to od_start_time
+    df = _attach_weather_for_shipments(df)
 
-    weather_main_categories = set()
-    for w in weather_lookup.values():
-        weather_main_categories.add(w["weather_main"])
-
-    weather_main_map = {wm: i for i, wm in enumerate(sorted(weather_main_categories))}
-
-    for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
-        df[col] = df["source_name"].map(lambda n, c=col: weather_lookup.get(n, {}).get(c, 0.0))
+    weather_main_categories = sorted(df["weather_main"].dropna().unique())
+    weather_main_map = {wm: i for i, wm in enumerate(weather_main_categories)}
 
     # --- CHANGE 1: Weather Dampening ---
     # Reduce impact of rain/snow so it doesn't immediately spike risk to 100%
     df["rain_1h"] = df["rain_1h"] * 0.4
     df["snow_1h"] = df["snow_1h"] * 0.4 
     
-    df["weather_main_raw"] = df["source_name"].map(lambda n: weather_lookup.get(n, {}).get("weather_main", "Clouds"))
+    df["weather_main_raw"] = df["weather_main"].fillna("Clear")
     df["weather_main_encoded"] = df["weather_main_raw"].map(weather_main_map).fillna(0).astype(int)
 
     # --- CHANGE 2: Stricter Thresholds ---
@@ -541,16 +591,19 @@ def _determine_state(risk):
 
 
 def _get_weather_cause(trip_uuid):
-    """Find the dominant weather factor for a shipment's source node."""
-    if shipments_df is None or graph is None:
+    """Find the dominant weather factor for a shipment's source at the closest 3-hour bucket."""
+    if shipments_df is None:
         return None
 
     rows = shipments_df[shipments_df["trip_uuid"] == trip_uuid]
     if rows.empty:
         return None
 
-    source = rows.iloc[0]["source_name"]
-    attrs = graph.nodes.get(source, {})
+    row = rows.iloc[0].copy()
+    df = pd.DataFrame([row])
+    df["od_start_time_parsed"] = pd.to_datetime(df["od_start_time"], format="mixed", dayfirst=False, errors="coerce")
+    df = _attach_weather_for_shipments(df)
+    attrs = df.iloc[0].to_dict()
 
     rain = float(attrs.get("rain_1h", 0))
     snow = float(attrs.get("snow_1h", 0))
