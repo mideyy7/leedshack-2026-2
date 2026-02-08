@@ -423,7 +423,7 @@ def compute_predictions():
             "risk": round(float(row["risk"]), 4),
             "expected_delay_hours": round(float(row["expected_delay_hours"]), 2),
         }
-        for uid, row in trip_preds.iterrows()
+        for uid, row in trip_preds.iterrows() if round(float(row["expected_delay_hours"]), 2) < 24
     }
 
     print(f"Predictions computed for {len(predictions_cache)} unique trips")
