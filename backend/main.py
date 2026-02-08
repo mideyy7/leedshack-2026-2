@@ -34,6 +34,7 @@ delay_regressor = None
 predictions_cache = None  # dict of trip_uuid -> {risk, expected_delay_hours}
 simulation_cache = None   # dict of trip_uuid -> {best_case, worst_case, expected_delay_hours, p10, p90}
 mitigation_cache = None   # dict of trip_uuid -> {strategy, expected_risk_reduction, solana_tx}
+story_cache = None        # dict of trip_uuid -> {story, previous_state, current_state, risk, ...}
 
 # Solana config
 SOLANA_RPC_URL = "https://api.devnet.solana.com"
@@ -501,6 +502,141 @@ def compute_mitigations():
     print(f"Mitigations computed: {len(mitigation_cache)} strategies, {on_chain_count} on-chain txs")
 
 
+# --- Phase 8: Journey Stories ---
+
+def _determine_state(risk):
+    """Classify shipment state based on risk score."""
+    if risk > 0.7:
+        return "delayed"
+    elif risk > 0.4:
+        return "at-risk"
+    return "on-time"
+
+
+def _get_weather_cause(trip_uuid):
+    """Find the dominant weather factor for a shipment's source node."""
+    if shipments_df is None or graph is None:
+        return None
+
+    rows = shipments_df[shipments_df["trip_uuid"] == trip_uuid]
+    if rows.empty:
+        return None
+
+    source = rows.iloc[0]["source_name"]
+    attrs = graph.nodes.get(source, {})
+
+    rain = float(attrs.get("rain_1h", 0))
+    snow = float(attrs.get("snow_1h", 0))
+    wind = float(attrs.get("wind_speed", 0))
+    weather = attrs.get("weather_main", "Clear")
+
+    if snow > 0:
+        return f"snowfall ({weather})"
+    if rain > 0.5:
+        return f"heavy rain ({weather})"
+    if wind > 10:
+        return f"high winds ({weather})"
+    if rain > 0:
+        return f"rain ({weather})"
+    if weather not in ("Clear", "Clouds"):
+        return weather.lower()
+    return None
+
+
+def _build_story(trip_uuid, pred, sim_data, mitigation_data):
+    """Generate a human-readable journey story for a shipment."""
+    risk = pred["risk"]
+    delay = pred["expected_delay_hours"]
+    current = _determine_state(risk)
+    previous = "on-time"  # all shipments start on-time
+
+    cause = _get_weather_cause(trip_uuid)
+    cause_phrase = f" due to {cause}" if cause else ""
+
+    # Build the narrative
+    if current == "on-time":
+        story = (
+            f"Shipment {trip_uuid} is on-time with a low risk score of "
+            f"{risk*100:.0f}%. No delays expected."
+        )
+    elif current == "at-risk":
+        story = (
+            f"Shipment {trip_uuid} was on-time until risk increased to "
+            f"{risk*100:.0f}%{cause_phrase}. "
+            f"Expected delay is {delay:.1f} hours. Monitoring closely."
+        )
+    else:  # delayed
+        story = (
+            f"Shipment {trip_uuid} was on-time until risk surged to "
+            f"{risk*100:.0f}%{cause_phrase}, triggering a delayed state. "
+            f"Expected delay is {delay:.1f} hours."
+        )
+
+        # Add simulation context if available
+        if sim_data:
+            story += (
+                f" Monte Carlo analysis shows delays ranging from "
+                f"{sim_data['best_case']:.1f}h (best) to "
+                f"{sim_data['worst_case']:.1f}h (worst case)."
+            )
+
+        # Add mitigation context if available
+        if mitigation_data:
+            story += (
+                f" Mitigation applied: {mitigation_data['strategy']}. "
+                f"Risk reduced by {mitigation_data['expected_risk_reduction']*100:.0f}%."
+            )
+
+    return story, previous, current
+
+
+def generate_stories():
+    """Generate journey stories for top risky shipments, optionally store on Solana."""
+    global story_cache
+
+    if predictions_cache is None:
+        print("WARNING: Predictions not available, skipping stories")
+        return
+
+    story_cache = {}
+
+    # Sort by risk desc, generate stories for top 20 non-trivial shipments
+    sorted_trips = sorted(
+        predictions_cache.items(), key=lambda x: x[1]["risk"], reverse=True
+    )
+
+    # Only generate stories for at-risk or delayed shipments (risk > 0.4)
+    risky_trips = [(uid, p) for uid, p in sorted_trips if p["risk"] > 0.4][:20]
+
+    # Top 3 get Solana memos
+    top_for_chain = set(uid for uid, _ in risky_trips[:3]) if SOLANA_ENABLED else set()
+
+    print(f"Generating journey stories for {len(risky_trips)} shipments...")
+
+    for uid, pred in risky_trips:
+        sim_data = simulation_cache.get(uid) if simulation_cache else None
+        mit_data = mitigation_cache.get(uid) if mitigation_cache else None
+
+        story_text, prev_state, curr_state = _build_story(uid, pred, sim_data, mit_data)
+
+        solana_tx = None
+        if uid in top_for_chain:
+            memo = f"ChainReaction|story|{uid}|{prev_state}->{curr_state}|risk:{pred['risk']:.2f}"
+            solana_tx = _trigger_solana_memo(uid, pred["risk"], memo)
+
+        story_cache[uid] = {
+            "story": story_text,
+            "previous_state": prev_state,
+            "current_state": curr_state,
+            "risk": pred["risk"],
+            "expected_delay_hours": pred["expected_delay_hours"],
+            "solana_tx": solana_tx,
+        }
+
+    on_chain = sum(1 for s in story_cache.values() if s["solana_tx"])
+    print(f"Stories generated: {len(story_cache)} stories, {on_chain} on-chain")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load data on startup."""
@@ -511,6 +647,7 @@ async def startup_event():
     compute_predictions()
     run_simulations()
     compute_mitigations()
+    generate_stories()
 
 
 @app.get("/")
@@ -608,6 +745,58 @@ async def mitigate():
     if mitigation_cache is None:
         return {"error": "Mitigations not computed yet"}
     return mitigation_cache
+
+
+@app.get("/story")
+async def get_stories():
+    """Return journey stories for risky shipments (Phase 8)."""
+    if story_cache is None:
+        return {"error": "Stories not generated yet"}
+    return story_cache
+
+
+@app.get("/graph/viz")
+async def graph_viz():
+    """Return graph nodes and edges with risk coloring for network visualization (Phase 9)."""
+    if graph is None:
+        return {"error": "Graph not loaded"}
+
+    # Build node risk from predictions: aggregate avg risk per location
+    node_risk = {}
+    if predictions_cache and shipments_df is not None:
+        df = shipments_df.copy()
+        df["risk"] = df["trip_uuid"].map(
+            lambda uid: predictions_cache.get(uid, {}).get("risk", 0)
+        )
+        for col in ["source_name", "destination_name"]:
+            agg = df.groupby(col)["risk"].mean()
+            for name, risk in agg.items():
+                node_risk[name] = max(node_risk.get(name, 0), float(risk))
+
+    nodes = []
+    for name in graph.nodes:
+        risk = node_risk.get(name, 0)
+        nodes.append({
+            "id": name,
+            "label": name.split("(")[0].strip().split("_")[0],
+            "risk": round(risk, 4),
+            "color": "#ff3864" if risk > 0.7 else "#ffd700" if risk > 0.4 else "#00ff88",
+        })
+
+    edges = []
+    for src, dst, attrs in graph.edges(data=True):
+        src_risk = node_risk.get(src, 0)
+        dst_risk = node_risk.get(dst, 0)
+        edge_risk = max(src_risk, dst_risk)
+        edges.append({
+            "source": src,
+            "target": dst,
+            "transit_time": attrs.get("transit_time", 0),
+            "distance": attrs.get("distance", 0),
+            "color": "#ff3864" if edge_risk > 0.7 else "#ffd700" if edge_risk > 0.4 else "#00ff88",
+        })
+
+    return {"nodes": nodes, "edges": edges}
 
 
 @app.get("/risk/stats")
