@@ -25,10 +25,16 @@ function App() {
   const PAGE_SIZE = 20;
 
   // --- ZOOM STATE ---
-  const svgRef = useRef();
+  const svgRef = useRef(null);
   const [transform, setTransform] = useState(d3.zoomIdentity);
 
   // --- LIVE TIMER ---
+  // Analysis state
+  const [analysisRun, setAnalysisRun] = useState(false);
+  const [runLoading, setRunLoading] = useState(false);
+  const [runResult, setRunResult] = useState(null);
+
+  // Live update timer
   useEffect(() => {
     const interval = setInterval(() => {
       setLastUpdate((prev) => prev + 3);
@@ -45,6 +51,9 @@ function App() {
     try {
       const response = await axios.get(`${API_BASE_URL}/health`);
       setApiStatus(response.data);
+      if (response.data.analysis_executed) {
+        setAnalysisRun(true);
+      }
       setLoading(false);
     } catch (error) {
       setApiStatus({ status: 'error', message: 'Cannot connect to backend' });
@@ -110,11 +119,40 @@ function App() {
   const fetchGraphData = useCallback(async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/graph/viz`);
-      if (!response.data.error) setGraphData(response.data);
+      if (!response.data.error) {
+        setGraphData(response.data);
+        // Initialize node positions using circular layout
+        if (response.data.nodes && Object.keys(nodePositions).length === 0) {
+          const nodes = response.data.nodes;
+          const uniqueLabels = [...new Set(nodes.map((n) => n.label))];
+          const width = 800;
+          const height = 500;
+          const padding = 80;
+          const positions = {};
+          nodes.forEach((node, i) => {
+            const labelIdx = uniqueLabels.indexOf(node.label);
+            const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
+            const radius = Math.min(width, height) / 2 - padding;
+            const jitter = (i % 3) * 18;
+            positions[node.id] = {
+              x: width / 2 + (radius - jitter) * Math.cos(angle),
+              y: height / 2 + (radius - jitter) * Math.sin(angle),
+            };
+          });
+          setNodePositions(positions);
+        }
+      }
     } catch (error) {
       console.error('Failed to fetch graph data:', error);
     }
-  }, []);
+  }, [nodePositions]);
+
+  // Fetch graph on startup (structural data only, no analysis needed)
+  useEffect(() => {
+    if (apiStatus?.graph_loaded) {
+      fetchGraphData();
+    }
+  }, [apiStatus, fetchGraphData]);
 
   // --- D3 ZOOM EFFECT ---
   useEffect(() => {
@@ -132,15 +170,100 @@ function App() {
   }, [loading, graphData]);
 
   // --- MAIN DATA LOAD EFFECT ---
+  // Fetch analysis data only after analysis has been run
   useEffect(() => {
-    if (apiStatus?.shipments_loaded) {
+    if (analysisRun) {
       fetchPredictions();
       fetchSimulations();
       fetchMitigations();
       fetchStories();
-      fetchGraphData();
+      fetchGraphData(); // re-fetch with risk coloring
     }
-  }, [apiStatus, fetchPredictions, fetchSimulations, fetchMitigations, fetchStories, fetchGraphData]);
+  }, [analysisRun, fetchPredictions, fetchSimulations, fetchMitigations, fetchStories, fetchGraphData]);
+
+  // Run Predictive Twin button handler
+  const handleRunAnalysis = async () => {
+    setRunLoading(true);
+    setRunResult(null);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/run-analysis`);
+      if (response.data.error) {
+        setRunResult({ error: response.data.error });
+      } else {
+        setRunResult(response.data);
+        setAnalysisRun(true);
+        setLastUpdate(0);
+      }
+    } catch (error) {
+      setRunResult({ error: 'Failed to connect to backend' });
+    }
+    setRunLoading(false);
+  };
+
+  // --- Interactive graph mouse handlers ---
+  const getSVGPoint = (e) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
+    return { x: svgP.x, y: svgP.y };
+  };
+
+  const handleNodeMouseDown = (e, nodeId) => {
+    e.stopPropagation();
+    setDragNode(nodeId);
+  };
+
+  const handleSvgMouseDown = (e) => {
+    if (dragNode) return;
+    setIsPanning(true);
+    setPanStart({ x: e.clientX, y: e.clientY, vx: viewBox.x, vy: viewBox.y });
+  };
+
+  const handleSvgMouseMove = (e) => {
+    if (dragNode) {
+      const pt = getSVGPoint(e);
+      setNodePositions((prev) => ({
+        ...prev,
+        [dragNode]: { x: pt.x, y: pt.y },
+      }));
+    } else if (isPanning && panStart) {
+      const svg = svgRef.current;
+      if (!svg) return;
+      const scale = viewBox.w / svg.clientWidth;
+      const dx = (e.clientX - panStart.x) * scale;
+      const dy = (e.clientY - panStart.y) * scale;
+      setViewBox((prev) => ({
+        ...prev,
+        x: panStart.vx - dx,
+        y: panStart.vy - dy,
+      }));
+    }
+  };
+
+  const handleSvgMouseUp = () => {
+    setDragNode(null);
+    setIsPanning(false);
+    setPanStart(null);
+  };
+
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+    const svg = svgRef.current;
+    if (!svg) return;
+
+    const pt = getSVGPoint(e);
+    setViewBox((prev) => {
+      const newW = prev.w * zoomFactor;
+      const newH = prev.h * zoomFactor;
+      const newX = pt.x - (pt.x - prev.x) * zoomFactor;
+      const newY = pt.y - (pt.y - prev.y) * zoomFactor;
+      return { x: newX, y: newY, w: Math.max(200, Math.min(2000, newW)), h: Math.max(125, Math.min(1250, newH)) };
+    });
+  };
 
 
   // --- DATA PROCESSING HELPERS ---
@@ -217,6 +340,7 @@ function App() {
     ? Object.entries(stories).map(([uid, s]) => ({ trip_uuid: uid, ...s }))
     : [];
 
+  // Summary stats (only available after analysis)
   const stats = predictions
     ? {
         total: predictions.length,
@@ -245,6 +369,7 @@ function App() {
       })()
     : [];
 
+  // Delay over time line chart
   const delayLineData = predictions
     ? (() => {
         const sorted = [...predictions].sort((a, b) => a.expected_delay_hours - b.expected_delay_hours);
@@ -288,7 +413,7 @@ function App() {
   // --- NETWORK GRAPH RENDERER ---
   const renderNetworkGraph = () => {
     if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
-      return <p className="loading-text">No graph data available</p>;
+      return <p className="loading-text">Loading supply chain graph...</p>;
     }
 
     const nodes = [...graphData.nodes].sort((a, b) => b.risk - a.risk);    
@@ -324,6 +449,13 @@ function App() {
           <marker id="arrowhead" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
             <polygon points="0 0, 6 2, 0 4" fill="#8b92a8" opacity="0.5" />
           </marker>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="3" result="coloredBlur" />
+            <feMerge>
+              <feMergeNode in="coloredBlur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
         </defs>
         
         {/* ZOOM WRAPPER */}
@@ -394,6 +526,23 @@ function App() {
 
   const isHealthy = apiStatus?.status === 'healthy';
 
+  // "Not yet run" placeholder for analysis tabs
+  const renderNotRunPlaceholder = (tabName) => (
+    <div className="panel not-run-panel">
+      <div className="not-run-content">
+        <div className="not-run-icon">&#9888;</div>
+        <h3>Analysis Not Yet Executed</h3>
+        <p>
+          {tabName} data will be available after you run the predictive twin analysis.
+          Go to the Overview tab and click <strong>Run Predictive Twin</strong> to start.
+        </p>
+        <button className="run-btn small" onClick={() => setActiveTab('overview')}>
+          Go to Overview
+        </button>
+      </div>
+    </div>
+  );
+
   return (
     <div>
       <div className="grain" />
@@ -405,16 +554,18 @@ function App() {
           <div className="status-bar">
             <div className="status-item">
               <span className={`status-dot ${isHealthy ? 'live' : 'error'}`} />
-              <span>{loading ? 'Connecting...' : isHealthy ? 'Live Twin Active' : 'Offline'}</span>
+              <span>{loading ? 'Connecting...' : isHealthy ? 'System Ready' : 'Offline'}</span>
             </div>
-            {stats && (
+            {analysisRun && stats && (
               <div className="status-item">
-                <span>{stats.total.toLocaleString()} Trips</span>
+                <span>{stats.total.toLocaleString()} Trips Analyzed</span>
               </div>
             )}
-            <div className="status-item">
-              <span>Last Update: {lastUpdate}s ago</span>
-            </div>
+            {analysisRun && (
+              <div className="status-item">
+                <span>Last Update: {lastUpdate}s ago</span>
+              </div>
+            )}
           </div>
         </div>
       </header>
@@ -424,7 +575,7 @@ function App() {
         {['overview', 'predictions', 'simulations', 'mitigation', 'stories'].map((tab) => (
           <button
             key={tab}
-            className={`tab ${activeTab === tab ? 'active' : ''}`}
+            className={`tab ${activeTab === tab ? 'active' : ''} ${!analysisRun && tab !== 'overview' ? 'tab-disabled' : ''}`}
             onClick={() => setActiveTab(tab)}
           >
             {tab === 'simulations' ? 'Monte Carlo' : tab === 'stories' ? 'Journey Stories' : tab}
@@ -434,408 +585,420 @@ function App() {
 
       <main className="app-main">
 
-        {/* ===== OVERVIEW TAB ===== */}
+        {/* ===== OVERVIEW / LANDING TAB ===== */}
         <div className={`tab-content ${activeTab === 'overview' ? 'active' : ''}`}>
-          {/* Metric cards */}
-          <div className="grid grid-4">
-            <div className="metric-card">
-              <div className="metric-label">Active Shipments</div>
-              <div className={`metric-value ${stats ? 'safe' : ''}`}>
-                {stats ? stats.total.toLocaleString() : '--'}
-              </div>
-              <div className="metric-change">All tracked trips</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">At Risk</div>
-              <div className={`metric-value ${stats?.highRisk > 0 ? 'warning' : 'safe'}`}>
-                {stats ? stats.highRisk.toLocaleString() : '--'}
-              </div>
-              <div className="metric-change">Risk &gt; 70%</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">Critical Alerts</div>
-              <div className={`metric-value ${stats?.highRisk > 0 ? 'critical' : 'safe'}`}>
-                {stats ? predictions.filter((p) => p.risk > 0.9).length : '--'}
-              </div>
-              <div className="metric-change">Auto-mitigation active</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">Avg Risk Score</div>
-              <div className="metric-value blue">
-                {stats ? `${stats.avgRisk}%` : '--'}
-              </div>
-              <div className="metric-change">Across all shipments</div>
-            </div>
-          </div>
 
-          {/* Risk Pie + Delay Line */}
-          <div className="grid grid-2">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Risk Breakdown</span>
-                <span className="panel-badge">All Shipments</span>
-              </div>
-              {riskPieData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={300}>
-                  <PieChart>
-                    <Pie
-                      data={riskPieData}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={60}
-                      outerRadius={100}
-                      paddingAngle={3}
-                      dataKey="value"
-                      label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-                    >
-                      {riskPieData.map((entry, idx) => (
-                        <Cell key={`cell-${idx}`} fill={entry.color} stroke="none" />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                      formatter={(value, name) => [`${value} shipments`, name]}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="loading-text">No prediction data available</p>
-              )}
-            </div>
-
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Expected Delay Curve</span>
-                <span className="panel-badge">All Trips</span>
-              </div>
-              {delayLineData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={delayLineData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
-                    <defs>
-                      <linearGradient id="delayGradient" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
-                    <XAxis dataKey="index" tick={{ fill: '#8b92a8', fontSize: 10 }} label={{ value: 'Shipment Bucket', position: 'insideBottom', offset: -5, fill: '#8b92a8', fontSize: 10 }} />
-                    <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
-                    <Tooltip
-                      contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                      formatter={(value, name) => name === 'delay' ? [`${value}h`, 'Avg Delay'] : [`${value}%`, 'Avg Risk']}
-                    />
-                    <Area type="monotone" dataKey="delay" name="delay" stroke="#3b82f6" fill="url(#delayGradient)" strokeWidth={2} />
-                    <Line type="monotone" dataKey="risk" name="risk" stroke="#ff3864" strokeWidth={1.5} dot={false} yAxisId={0} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="loading-text">No delay data available</p>
-              )}
-            </div>
-          </div>
-
-          {/* Risk Bar Chart + High-Risk List */}
-          <div className="grid grid-2">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Top Risky Shipments</span>
-                <span className="panel-badge">Top 30</span>
-              </div>
-              {chartData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={350}>
-                  <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
-                    <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
-                    <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} label={{ value: 'Risk %', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
-                    <Tooltip
-                      contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                      formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
-                    />
-                    <Bar dataKey="risk" name="risk" radius={[3, 3, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="loading-text">No prediction data available</p>
-              )}
-            </div>
-
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">High-Risk Shipments</span>
-              </div>
-              <div className="shipment-list">
-                {highRiskShipments.length > 0 ? highRiskShipments.map((ship) => (
-                  <div key={ship.trip_uuid} className={`shipment-item ${getStatusClass(ship.risk)}`}>
-                    <div className="shipment-header">
-                      <span className="shipment-id">{ship.trip_uuid.slice(-12)}</span>
-                      <span className={`risk-badge ${ship.risk > 0.7 ? 'high' : ship.risk > 0.4 ? 'medium' : 'low'}`}>
-                        {Math.round(ship.risk * 100)}%
-                      </span>
+          {/* LANDING PAGE (before analysis) */}
+          {!analysisRun && (
+            <>
+              {/* Hero Section */}
+              <div className="landing-hero">
+                <div className="hero-text">
+                  <h2 className="hero-title">Predictive Digital Twin for Global Supply Chains</h2>
+                  <p className="hero-description">
+                    Chain-Reaction is a predictive digital twin that simulates global supply chain networks,
+                    forecasts disruption risk using LightGBM machine learning models and real-time weather data,
+                    runs Monte Carlo simulations across hundreds of scenarios, and automatically triggers
+                    mitigation actions recorded on the Solana blockchain.
+                  </p>
+                  <div className="hero-features">
+                    <div className="hero-feature">
+                      <span className="feature-dot safe" />
+                      <span>Real-time weather integration</span>
                     </div>
-                    <div className="shipment-stats">
-                      <span>Delay: {ship.expected_delay_hours.toFixed(1)}h</span>
-                      <span>{ship.risk > 0.7 ? 'At Risk' : ship.risk > 0.4 ? 'Warning' : 'On Time'}</span>
+                    <div className="hero-feature">
+                      <span className="feature-dot blue" />
+                      <span>LightGBM risk prediction</span>
                     </div>
-                    <div className="progress-bar">
-                      <div
-                        className={`progress-fill ${getStatusClass(ship.risk)}`}
-                        style={{ width: `${Math.min(100, ship.risk * 100)}%` }}
-                      />
+                    <div className="hero-feature">
+                      <span className="feature-dot warning" />
+                      <span>Monte Carlo simulation</span>
+                    </div>
+                    <div className="hero-feature">
+                      <span className="feature-dot purple" />
+                      <span>Solana audit trail</span>
                     </div>
                   </div>
-                )) : (
-                  <p className="loading-text">No shipment data</p>
-                )}
+                </div>
+                <div className="hero-stats">
+                  <div className="hero-stat">
+                    <span className="hero-stat-value blue">
+                      {graphData ? graphData.nodes.length : '--'}
+                    </span>
+                    <span className="hero-stat-label">Supply Nodes</span>
+                  </div>
+                  <div className="hero-stat">
+                    <span className="hero-stat-value blue">
+                      {graphData ? graphData.edges.length : '--'}
+                    </span>
+                    <span className="hero-stat-label">Routes</span>
+                  </div>
+                  <div className="hero-stat">
+                    <span className="hero-stat-value safe">Ready</span>
+                    <span className="hero-stat-label">Models Loaded</span>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
 
-          {/* Supply Chain Network Graph */}
-          <div className="grid">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Supply Chain Network</span>
-                <span className="panel-badge">Color-coded by Risk</span>
+              {/* Interactive Graph */}
+              <div className="landing-graph-section">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Supply Chain Network</span>
+                    <span className="panel-badge">Interactive — Drag nodes, scroll to zoom</span>
+                  </div>
+                  <p className="chart-subtitle">
+                    Explore the supply chain digital twin. Drag nodes to rearrange. Scroll to zoom. All nodes currently on-time.
+                  </p>
+                  {renderInteractiveGraph()}
+                </div>
               </div>
               <p className="chart-subtitle">Nodes sized by risk score. Scroll to Zoom, Drag to Pan.</p>
               {renderNetworkGraph()}
             </div>
           </div>
 
-          {/* Top Stories + Mitigation Summary */}
-          <div className="grid grid-2">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Top Journey Stories</span>
-                <span className="panel-badge">Top 3</span>
+              {/* Run Button */}
+              <div className="run-section">
+                <button
+                  className={`run-btn ${runLoading ? 'loading' : ''}`}
+                  onClick={handleRunAnalysis}
+                  disabled={runLoading || !isHealthy}
+                >
+                  {runLoading ? (
+                    <>
+                      <span className="run-spinner" />
+                      Running Analysis Pipeline...
+                    </>
+                  ) : (
+                    'Run Predictive Twin'
+                  )}
+                </button>
+                {runLoading && (
+                  <p className="run-subtitle">
+                    Executing: Feature construction, LightGBM prediction, Monte Carlo simulation, mitigation decisions, Solana records...
+                  </p>
+                )}
+                {runResult?.error && (
+                  <p className="run-error">{runResult.error}</p>
+                )}
               </div>
-              {storyList.length > 0 ? storyList.slice(0, 3).map((s) => (
-                <div key={s.trip_uuid} className={`story-card ${s.current_state === 'delayed' ? 'critical' : ''}`}>
-                  <div className="story-header">
-                    <span className="story-id">{s.trip_uuid.slice(-12)}</span>
-                    <span className={`risk-badge ${s.risk > 0.7 ? 'high' : s.risk > 0.4 ? 'medium' : 'low'}`}>
-                      {(s.risk * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                  <div className="story-text">{s.story}</div>
-                </div>
-              )) : (
-                <p className="loading-text">No stories available</p>
-              )}
-            </div>
+            </>
+          )}
 
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Mitigation Summary</span>
-              </div>
-              <div className="mitigation-summary">
-                <div className="summary-stat">
-                  <span className="summary-label">Total Mitigated</span>
-                  <span className="summary-value purple">{mitigationList.length}</span>
-                </div>
-                <div className="summary-stat">
-                  <span className="summary-label">On-Chain Records</span>
-                  <span className="summary-value purple">{mitigationList.filter((m) => m.solana_tx).length}</span>
-                </div>
-                <div className="summary-stat">
-                  <span className="summary-label">Avg Risk Reduction</span>
-                  <span className="summary-value safe">
-                    {mitigationList.length > 0
-                      ? `-${(mitigationList.reduce((s, m) => s + m.expected_risk_reduction, 0) / mitigationList.length * 100).toFixed(0)}%`
-                      : '--'}
-                  </span>
-                </div>
-              </div>
-              {mitigationList.length > 0 && (
-                <div className="top-strategies">
-                  <div className="panel-header" style={{ marginTop: '1rem' }}>
-                    <span className="panel-title">Active Strategies</span>
+          {/* DASHBOARD (after analysis) */}
+          {analysisRun && (
+            <>
+              {/* Metric cards */}
+              <div className="grid grid-4">
+                <div className="metric-card">
+                  <div className="metric-label">Active Shipments</div>
+                  <div className={`metric-value ${stats ? 'safe' : ''}`}>
+                    {stats ? stats.total.toLocaleString() : '--'}
                   </div>
-                  {mitigationList.slice(0, 3).map((m) => (
-                    <div key={m.trip_uuid} className="strategy-item">
-                      <span className="strategy-id">{m.trip_uuid.slice(-8)}</span>
-                      <span className="strategy-action">{m.strategy}</span>
-                      <span className="text-safe">-{(m.expected_risk_reduction * 100).toFixed(0)}%</span>
-                    </div>
-                  ))}
+                  <div className="metric-change">All tracked trips</div>
                 </div>
-              )}
-            </div>
-          </div>
+                <div className="metric-card">
+                  <div className="metric-label">At Risk</div>
+                  <div className={`metric-value ${stats?.highRisk > 0 ? 'warning' : 'safe'}`}>
+                    {stats ? stats.highRisk.toLocaleString() : '--'}
+                  </div>
+                  <div className="metric-change">Risk &gt; 70%</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Critical Alerts</div>
+                  <div className={`metric-value ${stats?.highRisk > 0 ? 'critical' : 'safe'}`}>
+                    {stats ? predictions.filter((p) => p.risk > 0.9).length : '--'}
+                  </div>
+                  <div className="metric-change">Auto-mitigation active</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Avg Risk Score</div>
+                  <div className="metric-value blue">
+                    {stats ? `${stats.avgRisk}%` : '--'}
+                  </div>
+                  <div className="metric-change">Across all shipments</div>
+                </div>
+              </div>
+
+              {/* Risk Pie + Delay Line */}
+              <div className="grid grid-2">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Risk Breakdown</span>
+                    <span className="panel-badge">All Shipments</span>
+                  </div>
+                  {riskPieData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={300}>
+                      <PieChart>
+                        <Pie
+                          data={riskPieData}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={60}
+                          outerRadius={100}
+                          paddingAngle={3}
+                          dataKey="value"
+                          label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                        >
+                          {riskPieData.map((entry, idx) => (
+                            <Cell key={`cell-${idx}`} fill={entry.color} stroke="none" />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
+                          formatter={(value, name) => [`${value} shipments`, name]}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="loading-text">No prediction data available</p>
+                  )}
+                </div>
+
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Expected Delay Curve</span>
+                    <span className="panel-badge">All Trips</span>
+                  </div>
+                  {delayLineData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={300}>
+                      <AreaChart data={delayLineData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+                        <defs>
+                          <linearGradient id="delayGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
+                        <XAxis dataKey="index" tick={{ fill: '#8b92a8', fontSize: 10 }} label={{ value: 'Shipment Bucket', position: 'insideBottom', offset: -5, fill: '#8b92a8', fontSize: 10 }} />
+                        <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
+                        <Tooltip
+                          contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
+                          formatter={(value, name) => name === 'delay' ? [`${value}h`, 'Avg Delay'] : [`${value}%`, 'Avg Risk']}
+                        />
+                        <Area type="monotone" dataKey="delay" name="delay" stroke="#3b82f6" fill="url(#delayGradient)" strokeWidth={2} />
+                        <Line type="monotone" dataKey="risk" name="risk" stroke="#ff3864" strokeWidth={1.5} dot={false} yAxisId={0} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="loading-text">No delay data available</p>
+                  )}
+                </div>
+              </div>
+
+              {/* Risk Bar Chart + High-Risk List */}
+              <div className="grid grid-2">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Top Risky Shipments</span>
+                    <span className="panel-badge">Top 30</span>
+                  </div>
+                  {chartData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={350}>
+                      <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
+                        <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
+                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} label={{ value: 'Risk %', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
+                        <Tooltip
+                          contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
+                          formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
+                        />
+                        <Bar dataKey="risk" name="risk" radius={[3, 3, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="loading-text">No prediction data available</p>
+                  )}
+                </div>
+
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">High-Risk Shipments</span>
+                  </div>
+                  <div className="shipment-list">
+                    {highRiskShipments.length > 0 ? highRiskShipments.map((ship) => (
+                      <div key={ship.trip_uuid} className={`shipment-item ${getStatusClass(ship.risk)}`}>
+                        <div className="shipment-header">
+                          <span className="shipment-id">{ship.trip_uuid.slice(-12)}</span>
+                          <span className={`risk-badge ${ship.risk > 0.7 ? 'high' : ship.risk > 0.4 ? 'medium' : 'low'}`}>
+                            {Math.round(ship.risk * 100)}%
+                          </span>
+                        </div>
+                        <div className="shipment-stats">
+                          <span>Delay: {ship.expected_delay_hours.toFixed(1)}h</span>
+                          <span>{ship.risk > 0.7 ? 'At Risk' : ship.risk > 0.4 ? 'Warning' : 'On Time'}</span>
+                        </div>
+                        <div className="progress-bar">
+                          <div
+                            className={`progress-fill ${getStatusClass(ship.risk)}`}
+                            style={{ width: `${Math.min(100, ship.risk * 100)}%` }}
+                          />
+                        </div>
+                      </div>
+                    )) : (
+                      <p className="loading-text">No shipment data</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Supply Chain Network Graph (risk-colored) */}
+              <div className="grid">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Supply Chain Network</span>
+                    <span className="panel-badge">Color-coded by Risk</span>
+                  </div>
+                  <p className="chart-subtitle">Nodes sized by risk score. Green = safe, Yellow = warning, Red = critical. Drag to rearrange.</p>
+                  {renderInteractiveGraph()}
+                </div>
+              </div>
+
+              {/* Top Stories + Mitigation Summary */}
+              <div className="grid grid-2">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Top Journey Stories</span>
+                    <span className="panel-badge">Top 3</span>
+                  </div>
+                  {storyList.length > 0 ? storyList.slice(0, 3).map((s) => (
+                    <div key={s.trip_uuid} className={`story-card ${s.current_state === 'delayed' ? 'critical' : ''}`}>
+                      <div className="story-header">
+                        <span className="story-id">{s.trip_uuid.slice(-12)}</span>
+                        <span className={`risk-badge ${s.risk > 0.7 ? 'high' : s.risk > 0.4 ? 'medium' : 'low'}`}>
+                          {(s.risk * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                      <div className="story-text">{s.story}</div>
+                    </div>
+                  )) : (
+                    <p className="loading-text">No stories available</p>
+                  )}
+                </div>
+
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Mitigation Summary</span>
+                  </div>
+                  <div className="mitigation-summary">
+                    <div className="summary-stat">
+                      <span className="summary-label">Total Mitigated</span>
+                      <span className="summary-value purple">{mitigationList.length}</span>
+                    </div>
+                    <div className="summary-stat">
+                      <span className="summary-label">On-Chain Records</span>
+                      <span className="summary-value purple">{mitigationList.filter((m) => m.solana_tx).length}</span>
+                    </div>
+                    <div className="summary-stat">
+                      <span className="summary-label">Avg Risk Reduction</span>
+                      <span className="summary-value safe">
+                        {mitigationList.length > 0
+                          ? `-${(mitigationList.reduce((s, m) => s + m.expected_risk_reduction, 0) / mitigationList.length * 100).toFixed(0)}%`
+                          : '--'}
+                      </span>
+                    </div>
+                  </div>
+                  {mitigationList.length > 0 && (
+                    <div className="top-strategies">
+                      <div className="panel-header" style={{ marginTop: '1rem' }}>
+                        <span className="panel-title">Active Strategies</span>
+                      </div>
+                      {mitigationList.slice(0, 3).map((m) => (
+                        <div key={m.trip_uuid} className="strategy-item">
+                          <span className="strategy-id">{m.trip_uuid.slice(-8)}</span>
+                          <span className="strategy-action">{m.strategy}</span>
+                          <span className="text-safe">-{(m.expected_risk_reduction * 100).toFixed(0)}%</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         {/* ===== PREDICTIONS TAB ===== */}
         <div className={`tab-content ${activeTab === 'predictions' ? 'active' : ''}`}>
-          <div className="grid">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">ML Model Predictions</span>
-                <span className="panel-badge">LightGBM</span>
-              </div>
-              {predLoading ? (
-                <p className="loading-text">Loading predictions...</p>
-              ) : predictions ? (
-                <>
-                  <table className="pred-table">
-                    <thead>
-                      <tr>
-                        <th>Trip UUID</th>
-                        <th className="sortable" onClick={() => handleSort('risk')}>
-                          Risk {sortBy === 'risk' ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
-                        </th>
-                        <th className="sortable" onClick={() => handleSort('expected_delay_hours')}>
-                          Expected Delay {sortBy === 'expected_delay_hours' ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
-                        </th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {pagedData.map((p) => (
-                        <tr key={p.trip_uuid}>
-                          <td className="mono">{p.trip_uuid}</td>
-                          <td>
-                            <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
-                              {(p.risk * 100).toFixed(1)}%
-                            </span>
-                          </td>
-                          <td>{p.expected_delay_hours.toFixed(2)}h</td>
-                          <td>
-                            <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
-                              {p.risk > 0.7 ? 'At Risk' : p.risk > 0.4 ? 'Warning' : 'On Time'}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  <div className="pagination">
-                    <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}>
-                      Previous
-                    </button>
-                    <span>Page {page + 1} of {totalPages}</span>
-                    <button onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}>
-                      Next
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <p className="loading-text">No prediction data available</p>
-              )}
-            </div>
-          </div>
-
-          {/* Risk bar chart */}
-          {chartData.length > 0 && (
-            <div className="grid">
-              <div className="panel">
-                <div className="panel-header">
-                  <span className="panel-title">Risk Distribution</span>
-                  <span className="panel-badge">Top 30</span>
-                </div>
-                <ResponsiveContainer width="100%" height={350}>
-                  <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
-                    <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
-                    <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} />
-                    <Tooltip
-                      contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                      formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
-                    />
-                    <Bar dataKey="risk" name="risk" radius={[3, 3, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* ===== MONTE CARLO TAB ===== */}
-        <div className={`tab-content ${activeTab === 'simulations' ? 'active' : ''}`}>
-          {simLoading ? (
-            <div className="panel"><p className="loading-text">Running Monte Carlo simulations...</p></div>
-          ) : (
+          {!analysisRun ? renderNotRunPlaceholder('Predictions') : (
             <>
-              {/* Top shipment detail */}
-              {topSimulation && (
-                <div className="grid">
-                  <div className="panel">
-                    <div className="panel-header">
-                      <span className="panel-title">Monte Carlo Simulation: {topSimulation.trip_uuid.slice(-12)}</span>
-                      <span className="panel-badge">{100} Scenarios</span>
-                    </div>
-                    <p className="chart-subtitle">Most volatile shipment by delay spread</p>
-                    <div className="simulation-result">
-                      <div className="sim-metric">
-                        <div className="sim-label">Best Case</div>
-                        <div className="sim-value safe">{topSimulation.best_case.toFixed(1)}h</div>
-                      </div>
-                      <div className="sim-metric">
-                        <div className="sim-label">P10</div>
-                        <div className="sim-value blue">{topSimulation.p10.toFixed(1)}h</div>
-                      </div>
-                      <div className="sim-metric">
-                        <div className="sim-label">Expected</div>
-                        <div className="sim-value warning">{topSimulation.expected_delay_hours.toFixed(1)}h</div>
-                      </div>
-                      <div className="sim-metric">
-                        <div className="sim-label">P90</div>
-                        <div className="sim-value blue">{topSimulation.p90.toFixed(1)}h</div>
-                      </div>
-                      <div className="sim-metric">
-                        <div className="sim-label">Worst Case</div>
-                        <div className="sim-value critical">{topSimulation.worst_case.toFixed(1)}h</div>
-                      </div>
-                    </div>
+              <div className="grid">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">ML Model Predictions</span>
+                    <span className="panel-badge">LightGBM</span>
                   </div>
+                  {predLoading ? (
+                    <p className="loading-text">Loading predictions...</p>
+                  ) : predictions ? (
+                    <>
+                      <table className="pred-table">
+                        <thead>
+                          <tr>
+                            <th>Trip UUID</th>
+                            <th className="sortable" onClick={() => handleSort('risk')}>
+                              Risk {sortBy === 'risk' ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
+                            </th>
+                            <th className="sortable" onClick={() => handleSort('expected_delay_hours')}>
+                              Expected Delay {sortBy === 'expected_delay_hours' ? (sortDir === 'desc' ? '\u25BC' : '\u25B2') : ''}
+                            </th>
+                            <th>Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {pagedData.map((p) => (
+                            <tr key={p.trip_uuid}>
+                              <td className="mono">{p.trip_uuid}</td>
+                              <td>
+                                <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
+                                  {(p.risk * 100).toFixed(1)}%
+                                </span>
+                              </td>
+                              <td>{p.expected_delay_hours.toFixed(2)}h</td>
+                              <td>
+                                <span className={`risk-badge ${p.risk > 0.7 ? 'high' : p.risk > 0.4 ? 'medium' : 'low'}`}>
+                                  {p.risk > 0.7 ? 'At Risk' : p.risk > 0.4 ? 'Warning' : 'On Time'}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <div className="pagination">
+                        <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}>
+                          Previous
+                        </button>
+                        <span>Page {page + 1} of {totalPages}</span>
+                        <button onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}>
+                          Next
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="loading-text">No prediction data available</p>
+                  )}
                 </div>
-              )}
+              </div>
 
-              {/* All simulations chart */}
-              {simChartData.length > 0 && (
+              {/* Risk bar chart */}
+              {chartData.length > 0 && (
                 <div className="grid">
                   <div className="panel">
                     <div className="panel-header">
-                      <span className="panel-title">Top 20 Most Volatile Shipments</span>
+                      <span className="panel-title">Risk Distribution</span>
+                      <span className="panel-badge">Top 30</span>
                     </div>
-                    <p className="chart-subtitle">100 scenarios per shipment — best / expected / worst case delays (hours)</p>
-                    <ResponsiveContainer width="100%" height={400}>
-                      <BarChart data={simChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
+                    <ResponsiveContainer width="100%" height={350}>
+                      <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
                         <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
-                        <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
+                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} />
                         <Tooltip
                           contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                          formatter={(value) => [`${value}h`]}
+                          formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
                         />
-                        <Legend wrapperStyle={{ color: '#8b92a8' }} />
-                        <Bar dataKey="best_case" name="Best Case" fill="#00ff88" radius={[3, 3, 0, 0]} />
-                        <Bar dataKey="expected" name="Expected" fill="#3b82f6" radius={[3, 3, 0, 0]} />
-                        <Bar dataKey="worst_case" name="Worst Case" fill="#ff3864" radius={[3, 3, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-              )}
-
-              {/* Delay distribution histogram */}
-              {delayDistribution.length > 0 && (
-                <div className="grid">
-                  <div className="panel">
-                    <div className="panel-header">
-                      <span className="panel-title">Delay Distribution</span>
-                      <span className="panel-badge">All Simulations</span>
-                    </div>
-                    <p className="chart-subtitle">Distribution of expected delays across all simulated shipments</p>
-                    <ResponsiveContainer width="100%" height={300}>
-                      <BarChart data={delayDistribution} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
-                        <XAxis dataKey="range" angle={-45} textAnchor="end" fontSize={9} tick={{ fill: '#8b92a8' }} />
-                        <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Count', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
-                        <Tooltip
-                          contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
-                          formatter={(value) => [`${value} shipments`, 'Count']}
-                        />
-                        <Bar dataKey="count" name="Shipments" fill="#a855f7" radius={[3, 3, 0, 0]} />
+                        <Bar dataKey="risk" name="risk" radius={[3, 3, 0, 0]} />
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
@@ -845,126 +1008,232 @@ function App() {
           )}
         </div>
 
+        {/* ===== MONTE CARLO TAB ===== */}
+        <div className={`tab-content ${activeTab === 'simulations' ? 'active' : ''}`}>
+          {!analysisRun ? renderNotRunPlaceholder('Monte Carlo Simulation') : (
+            <>
+              {simLoading ? (
+                <div className="panel"><p className="loading-text">Running Monte Carlo simulations...</p></div>
+              ) : (
+                <>
+                  {/* Top shipment detail */}
+                  {topSimulation && (
+                    <div className="grid">
+                      <div className="panel">
+                        <div className="panel-header">
+                          <span className="panel-title">Monte Carlo Simulation: {topSimulation.trip_uuid.slice(-12)}</span>
+                          <span className="panel-badge">{100} Scenarios</span>
+                        </div>
+                        <p className="chart-subtitle">Most volatile shipment by delay spread</p>
+                        <div className="simulation-result">
+                          <div className="sim-metric">
+                            <div className="sim-label">Best Case</div>
+                            <div className="sim-value safe">{topSimulation.best_case.toFixed(1)}h</div>
+                          </div>
+                          <div className="sim-metric">
+                            <div className="sim-label">P10</div>
+                            <div className="sim-value blue">{topSimulation.p10.toFixed(1)}h</div>
+                          </div>
+                          <div className="sim-metric">
+                            <div className="sim-label">Expected</div>
+                            <div className="sim-value warning">{topSimulation.expected_delay_hours.toFixed(1)}h</div>
+                          </div>
+                          <div className="sim-metric">
+                            <div className="sim-label">P90</div>
+                            <div className="sim-value blue">{topSimulation.p90.toFixed(1)}h</div>
+                          </div>
+                          <div className="sim-metric">
+                            <div className="sim-label">Worst Case</div>
+                            <div className="sim-value critical">{topSimulation.worst_case.toFixed(1)}h</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* All simulations chart */}
+                  {simChartData.length > 0 && (
+                    <div className="grid">
+                      <div className="panel">
+                        <div className="panel-header">
+                          <span className="panel-title">Top 20 Most Volatile Shipments</span>
+                        </div>
+                        <p className="chart-subtitle">100 scenarios per shipment — best / expected / worst case delays (hours)</p>
+                        <ResponsiveContainer width="100%" height={400}>
+                          <BarChart data={simChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
+                            <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
+                            <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Delay (hours)', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
+                            <Tooltip
+                              contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
+                              formatter={(value) => [`${value}h`]}
+                            />
+                            <Legend wrapperStyle={{ color: '#8b92a8' }} />
+                            <Bar dataKey="best_case" name="Best Case" fill="#00ff88" radius={[3, 3, 0, 0]} />
+                            <Bar dataKey="expected" name="Expected" fill="#3b82f6" radius={[3, 3, 0, 0]} />
+                            <Bar dataKey="worst_case" name="Worst Case" fill="#ff3864" radius={[3, 3, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Delay distribution histogram */}
+                  {delayDistribution.length > 0 && (
+                    <div className="grid">
+                      <div className="panel">
+                        <div className="panel-header">
+                          <span className="panel-title">Delay Distribution</span>
+                          <span className="panel-badge">All Simulations</span>
+                        </div>
+                        <p className="chart-subtitle">Distribution of expected delays across all simulated shipments</p>
+                        <ResponsiveContainer width="100%" height={300}>
+                          <BarChart data={delayDistribution} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
+                            <XAxis dataKey="range" angle={-45} textAnchor="end" fontSize={9} tick={{ fill: '#8b92a8' }} />
+                            <YAxis tick={{ fill: '#8b92a8' }} label={{ value: 'Count', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
+                            <Tooltip
+                              contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
+                              formatter={(value) => [`${value} shipments`, 'Count']}
+                            />
+                            <Bar dataKey="count" name="Shipments" fill="#a855f7" radius={[3, 3, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+        </div>
+
         {/* ===== MITIGATION TAB ===== */}
         <div className={`tab-content ${activeTab === 'mitigation' ? 'active' : ''}`}>
-          <div className="grid grid-4">
-            <div className="metric-card">
-              <div className="metric-label">Mitigated Shipments</div>
-              <div className="metric-value purple">{mitigationList.length}</div>
-              <div className="metric-change">Risk &gt; 70%</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">On-Chain Records</div>
-              <div className="metric-value purple">{mitigationList.filter((m) => m.solana_tx).length}</div>
-              <div className="metric-change">Solana devnet</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">Avg Risk Reduction</div>
-              <div className="metric-value safe">
-                {mitigationList.length > 0
-                  ? `-${(mitigationList.reduce((s, m) => s + m.expected_risk_reduction, 0) / mitigationList.length * 100).toFixed(0)}%`
-                  : '--'}
-              </div>
-              <div className="metric-change">Per shipment</div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-label">Top Strategy</div>
-              <div className="metric-value blue" style={{ fontSize: '1rem' }}>
-                {mitigationList.length > 0 ? mitigationList[0]?.strategy?.split(' ').slice(0, 2).join(' ') : '--'}
-              </div>
-              <div className="metric-change">Most applied</div>
-            </div>
-          </div>
-
-          <div className="grid">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Active Mitigations</span>
-                {mitigationList.filter((m) => m.solana_tx).length > 0 && (
-                  <span className="panel-badge">
-                    {mitigationList.filter((m) => m.solana_tx).length} on Solana
-                  </span>
-                )}
-              </div>
-              {mitigationList.length > 0 ? mitigationList.slice(0, 50).map((m) => (
-                <div key={m.trip_uuid} className="mitigation-card">
-                  <div className="mitigation-header">
-                    <span className="mitigation-action">{m.trip_uuid.slice(-12)}: {m.strategy}</span>
-                    {m.solana_tx && !m.solana_tx.startsWith('DEMO_') ? (
-                      <a
-                        href={`${SOLANA_EXPLORER}/${m.solana_tx}?cluster=devnet`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="solana-link"
-                      >
-                        View TX
-                      </a>
-                    ) : m.solana_tx ? (
-                      <span className="solana-demo-badge">On-Chain (Demo)</span>
-                    ) : null}
-                  </div>
-                  <div className="mitigation-desc">
-                    Risk reduced by {(m.expected_risk_reduction * 100).toFixed(0)}%.
-                    Mitigated risk: {(m.mitigated_risk * 100).toFixed(1)}%.
-                  </div>
-                  <div className="mitigation-stats">
-                    <span>Original: <span className="text-critical">{((m.mitigated_risk + m.expected_risk_reduction) * 100).toFixed(0)}%</span></span>
-                    <span>After: <span className="text-safe">{(m.mitigated_risk * 100).toFixed(0)}%</span></span>
-                    <span>Reduction: <span className="text-safe">-{(m.expected_risk_reduction * 100).toFixed(0)}%</span></span>
-                  </div>
+          {!analysisRun ? renderNotRunPlaceholder('Mitigation') : (
+            <>
+              <div className="grid grid-4">
+                <div className="metric-card">
+                  <div className="metric-label">Mitigated Shipments</div>
+                  <div className="metric-value purple">{mitigationList.length}</div>
+                  <div className="metric-change">Risk &gt; 70%</div>
                 </div>
-              )) : (
-                <p className="loading-text">No mitigations computed yet</p>
-              )}
-            </div>
-          </div>
+                <div className="metric-card">
+                  <div className="metric-label">On-Chain Records</div>
+                  <div className="metric-value purple">{mitigationList.filter((m) => m.solana_tx).length}</div>
+                  <div className="metric-change">Solana devnet</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Avg Risk Reduction</div>
+                  <div className="metric-value safe">
+                    {mitigationList.length > 0
+                      ? `-${(mitigationList.reduce((s, m) => s + m.expected_risk_reduction, 0) / mitigationList.length * 100).toFixed(0)}%`
+                      : '--'}
+                  </div>
+                  <div className="metric-change">Per shipment</div>
+                </div>
+                <div className="metric-card">
+                  <div className="metric-label">Top Strategy</div>
+                  <div className="metric-value blue" style={{ fontSize: '1rem' }}>
+                    {mitigationList.length > 0 ? mitigationList[0]?.strategy?.split(' ').slice(0, 2).join(' ') : '--'}
+                  </div>
+                  <div className="metric-change">Most applied</div>
+                </div>
+              </div>
+
+              <div className="grid">
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title">Active Mitigations</span>
+                    {mitigationList.filter((m) => m.solana_tx).length > 0 && (
+                      <span className="panel-badge">
+                        {mitigationList.filter((m) => m.solana_tx).length} on Solana
+                      </span>
+                    )}
+                  </div>
+                  {mitigationList.length > 0 ? mitigationList.slice(0, 50).map((m) => (
+                    <div key={m.trip_uuid} className="mitigation-card">
+                      <div className="mitigation-header">
+                        <span className="mitigation-action">{m.trip_uuid.slice(-12)}: {m.strategy}</span>
+                        {m.solana_tx && !m.solana_tx.startsWith('DEMO_') ? (
+                          <a
+                            href={`${SOLANA_EXPLORER}/${m.solana_tx}?cluster=devnet`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="solana-link"
+                          >
+                            View TX
+                          </a>
+                        ) : m.solana_tx ? (
+                          <span className="solana-demo-badge">On-Chain (Demo)</span>
+                        ) : null}
+                      </div>
+                      <div className="mitigation-desc">
+                        Risk reduced by {(m.expected_risk_reduction * 100).toFixed(0)}%.
+                        Mitigated risk: {(m.mitigated_risk * 100).toFixed(1)}%.
+                      </div>
+                      <div className="mitigation-stats">
+                        <span>Original: <span className="text-critical">{((m.mitigated_risk + m.expected_risk_reduction) * 100).toFixed(0)}%</span></span>
+                        <span>After: <span className="text-safe">{(m.mitigated_risk * 100).toFixed(0)}%</span></span>
+                        <span>Reduction: <span className="text-safe">-{(m.expected_risk_reduction * 100).toFixed(0)}%</span></span>
+                      </div>
+                    </div>
+                  )) : (
+                    <p className="loading-text">No mitigations computed yet</p>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         {/* ===== JOURNEY STORIES TAB ===== */}
         <div className={`tab-content ${activeTab === 'stories' ? 'active' : ''}`}>
-          <div className="grid">
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Shipment Journey Stories</span>
-                {storyList.length > 0 && (
-                  <span className="panel-badge">{storyList.length} stories</span>
+          {!analysisRun ? renderNotRunPlaceholder('Journey Stories') : (
+            <div className="grid">
+              <div className="panel">
+                <div className="panel-header">
+                  <span className="panel-title">Shipment Journey Stories</span>
+                  {storyList.length > 0 && (
+                    <span className="panel-badge">{storyList.length} stories</span>
+                  )}
+                </div>
+                {storyList.length > 0 ? storyList.map((s) => (
+                  <div key={s.trip_uuid} className={`story-card ${s.current_state === 'delayed' ? 'critical' : ''}`}>
+                    <div className="story-header">
+                      <span className="story-id">{s.trip_uuid.slice(-12)}</span>
+                      <span className="story-time">
+                        {s.previous_state} &rarr; {s.current_state}
+                      </span>
+                    </div>
+                    <div className="story-text">{s.story}</div>
+                    <div className="story-meta">
+                      <span className={`risk-badge ${s.risk > 0.7 ? 'high' : s.risk > 0.4 ? 'medium' : 'low'}`}>
+                        Risk: {(s.risk * 100).toFixed(0)}%
+                      </span>
+                      <span className="text-muted">Delay: {s.expected_delay_hours.toFixed(1)}h</span>
+                      {s.solana_tx && !s.solana_tx.startsWith('DEMO_') ? (
+                        <a
+                          href={`${SOLANA_EXPLORER}/${s.solana_tx}?cluster=devnet`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="solana-link"
+                        >
+                          View on Solana
+                        </a>
+                      ) : s.solana_tx ? (
+                        <span className="solana-demo-badge">On-Chain (Demo)</span>
+                      ) : (
+                        <span className="text-muted">Off-chain</span>
+                      )}
+                    </div>
+                  </div>
+                )) : (
+                  <p className="loading-text">No journey stories available yet</p>
                 )}
               </div>
-              {storyList.length > 0 ? storyList.map((s) => (
-                <div key={s.trip_uuid} className={`story-card ${s.current_state === 'delayed' ? 'critical' : ''}`}>
-                  <div className="story-header">
-                    <span className="story-id">{s.trip_uuid.slice(-12)}</span>
-                    <span className="story-time">
-                      {s.previous_state} &rarr; {s.current_state}
-                    </span>
-                  </div>
-                  <div className="story-text">{s.story}</div>
-                  <div className="story-meta">
-                    <span className={`risk-badge ${s.risk > 0.7 ? 'high' : s.risk > 0.4 ? 'medium' : 'low'}`}>
-                      Risk: {(s.risk * 100).toFixed(0)}%
-                    </span>
-                    <span className="text-muted">Delay: {s.expected_delay_hours.toFixed(1)}h</span>
-                    {s.solana_tx && !s.solana_tx.startsWith('DEMO_') ? (
-                      <a
-                        href={`${SOLANA_EXPLORER}/${s.solana_tx}?cluster=devnet`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="solana-link"
-                      >
-                        View on Solana
-                      </a>
-                    ) : s.solana_tx ? (
-                      <span className="solana-demo-badge">On-Chain (Demo)</span>
-                    ) : (
-                      <span className="text-muted">Off-chain</span>
-                    )}
-                  </div>
-                </div>
-              )) : (
-                <p className="loading-text">No journey stories available yet</p>
-              )}
             </div>
-          </div>
+          )}
         </div>
 
       </main>
