@@ -28,13 +28,11 @@ function App() {
   const svgRef = useRef(null);
   const [transform, setTransform] = useState(d3.zoomIdentity);
 
-  // --- LIVE TIMER ---
-  // Analysis state
+  // --- LIVE TIMER & ANALYSIS STATE ---
   const [analysisRun, setAnalysisRun] = useState(false);
   const [runLoading, setRunLoading] = useState(false);
   const [runResult, setRunResult] = useState(null);
 
-  // Live update timer
   useEffect(() => {
     const interval = setInterval(() => {
       setLastUpdate((prev) => prev + 3);
@@ -61,7 +59,7 @@ function App() {
     }
   };
 
-  // --- DATA FETCHERS (Defined BEFORE they are used) ---
+  // --- DATA FETCHERS ---
   const fetchPredictions = useCallback(async () => {
     setPredLoading(true);
     try {
@@ -121,63 +119,42 @@ function App() {
       const response = await axios.get(`${API_BASE_URL}/graph/viz`);
       if (!response.data.error) {
         setGraphData(response.data);
-        // Initialize node positions using circular layout
-        if (response.data.nodes && Object.keys(nodePositions).length === 0) {
-          const nodes = response.data.nodes;
-          const uniqueLabels = [...new Set(nodes.map((n) => n.label))];
-          const width = 800;
-          const height = 500;
-          const padding = 80;
-          const positions = {};
-          nodes.forEach((node, i) => {
-            const labelIdx = uniqueLabels.indexOf(node.label);
-            const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
-            const radius = Math.min(width, height) / 2 - padding;
-            const jitter = (i % 3) * 18;
-            positions[node.id] = {
-              x: width / 2 + (radius - jitter) * Math.cos(angle),
-              y: height / 2 + (radius - jitter) * Math.sin(angle),
-            };
-          });
-          setNodePositions(positions);
-        }
       }
     } catch (error) {
       console.error('Failed to fetch graph data:', error);
     }
-  }, [nodePositions]);
+  }, []);
 
-  // Fetch graph on startup (structural data only, no analysis needed)
+  // Fetch graph on startup
   useEffect(() => {
     if (apiStatus?.graph_loaded) {
       fetchGraphData();
     }
   }, [apiStatus, fetchGraphData]);
 
-  // --- D3 ZOOM EFFECT ---
+  // --- D3 ZOOM EFFECT (The Critical Fix) ---
   useEffect(() => {
     if (!svgRef.current) return;
 
     const svg = d3.select(svgRef.current);
     const zoom = d3.zoom()
-      .scaleExtent([0.1, 10]) // Min zoom 0.1x, Max zoom 10x
+      .scaleExtent([0.1, 10]) 
       .on('zoom', (event) => {
         setTransform(event.transform);
       });
 
     svg.call(zoom);
     svg.style("user-select", "none");
-  }, [loading, graphData]);
+  }, [loading, graphData]); // Re-run when data loads
 
   // --- MAIN DATA LOAD EFFECT ---
-  // Fetch analysis data only after analysis has been run
   useEffect(() => {
     if (analysisRun) {
       fetchPredictions();
       fetchSimulations();
       fetchMitigations();
       fetchStories();
-      fetchGraphData(); // re-fetch with risk coloring
+      fetchGraphData();
     }
   }, [analysisRun, fetchPredictions, fetchSimulations, fetchMitigations, fetchStories, fetchGraphData]);
 
@@ -199,72 +176,6 @@ function App() {
     }
     setRunLoading(false);
   };
-
-  // --- Interactive graph mouse handlers ---
-  const getSVGPoint = (e) => {
-    const svg = svgRef.current;
-    if (!svg) return { x: 0, y: 0 };
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX;
-    pt.y = e.clientY;
-    const svgP = pt.matrixTransform(svg.getScreenCTM().inverse());
-    return { x: svgP.x, y: svgP.y };
-  };
-
-  const handleNodeMouseDown = (e, nodeId) => {
-    e.stopPropagation();
-    setDragNode(nodeId);
-  };
-
-  const handleSvgMouseDown = (e) => {
-    if (dragNode) return;
-    setIsPanning(true);
-    setPanStart({ x: e.clientX, y: e.clientY, vx: viewBox.x, vy: viewBox.y });
-  };
-
-  const handleSvgMouseMove = (e) => {
-    if (dragNode) {
-      const pt = getSVGPoint(e);
-      setNodePositions((prev) => ({
-        ...prev,
-        [dragNode]: { x: pt.x, y: pt.y },
-      }));
-    } else if (isPanning && panStart) {
-      const svg = svgRef.current;
-      if (!svg) return;
-      const scale = viewBox.w / svg.clientWidth;
-      const dx = (e.clientX - panStart.x) * scale;
-      const dy = (e.clientY - panStart.y) * scale;
-      setViewBox((prev) => ({
-        ...prev,
-        x: panStart.vx - dx,
-        y: panStart.vy - dy,
-      }));
-    }
-  };
-
-  const handleSvgMouseUp = () => {
-    setDragNode(null);
-    setIsPanning(false);
-    setPanStart(null);
-  };
-
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
-    const svg = svgRef.current;
-    if (!svg) return;
-
-    const pt = getSVGPoint(e);
-    setViewBox((prev) => {
-      const newW = prev.w * zoomFactor;
-      const newH = prev.h * zoomFactor;
-      const newX = pt.x - (pt.x - prev.x) * zoomFactor;
-      const newY = pt.y - (pt.y - prev.y) * zoomFactor;
-      return { x: newX, y: newY, w: Math.max(200, Math.min(2000, newW)), h: Math.max(125, Math.min(1250, newH)) };
-    });
-  };
-
 
   // --- DATA PROCESSING HELPERS ---
   const sortedPredictions = predictions
@@ -340,7 +251,6 @@ function App() {
     ? Object.entries(stories).map(([uid, s]) => ({ trip_uuid: uid, ...s }))
     : [];
 
-  // Summary stats (only available after analysis)
   const stats = predictions
     ? {
         total: predictions.length,
@@ -369,7 +279,6 @@ function App() {
       })()
     : [];
 
-  // Delay over time line chart
   const delayLineData = predictions
     ? (() => {
         const sorted = [...predictions].sort((a, b) => a.expected_delay_hours - b.expected_delay_hours);
@@ -449,13 +358,6 @@ function App() {
           <marker id="arrowhead" markerWidth="6" markerHeight="4" refX="6" refY="2" orient="auto">
             <polygon points="0 0, 6 2, 0 4" fill="#8b92a8" opacity="0.5" />
           </marker>
-          <filter id="glow">
-            <feGaussianBlur stdDeviation="3" result="coloredBlur" />
-            <feMerge>
-              <feMergeNode in="coloredBlur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
         </defs>
         
         {/* ZOOM WRAPPER */}
@@ -650,13 +552,9 @@ function App() {
                   <p className="chart-subtitle">
                     Explore the supply chain digital twin. Drag nodes to rearrange. Scroll to zoom. All nodes currently on-time.
                   </p>
-                  {renderInteractiveGraph()}
+                  {renderNetworkGraph()}
                 </div>
               </div>
-              <p className="chart-subtitle">Nodes sized by risk score. Scroll to Zoom, Drag to Pan.</p>
-              {renderNetworkGraph()}
-            </div>
-          </div>
 
               {/* Run Button */}
               <div className="run-section">
@@ -851,7 +749,7 @@ function App() {
                     <span className="panel-badge">Color-coded by Risk</span>
                   </div>
                   <p className="chart-subtitle">Nodes sized by risk score. Green = safe, Yellow = warning, Red = critical. Drag to rearrange.</p>
-                  {renderInteractiveGraph()}
+                  {renderNetworkGraph()}
                 </div>
               </div>
 
@@ -993,7 +891,7 @@ function App() {
                       <BarChart data={coloredChartData} margin={{ top: 10, right: 20, left: 0, bottom: 60 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,146,168,0.12)" />
                         <XAxis dataKey="name" angle={-45} textAnchor="end" fontSize={10} tick={{ fill: '#8b92a8' }} />
-                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} />
+                        <YAxis domain={[0, 100]} tick={{ fill: '#8b92a8' }} label={{ value: 'Risk %', angle: -90, position: 'insideLeft', fill: '#8b92a8' }} />
                         <Tooltip
                           contentStyle={{ background: '#141920', border: '1px solid rgba(139,146,168,0.12)', borderRadius: 4, color: '#e6e9f0' }}
                           formatter={(value, name) => name === 'risk' ? [`${value}%`, 'Risk'] : [`${value}h`, 'Delay']}
