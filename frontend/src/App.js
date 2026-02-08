@@ -210,6 +210,9 @@ function App() {
 
   // --- RISK COLOR CALCULATOR ---
   const getRiskColor = (risk) => {
+    // If no risk, return a subtle grey
+    if (risk === undefined || risk === null) return "rgba(255,255,255,0.1)";
+
     const p = Math.max(0, Math.min(1, risk));
     if (p < 0.5) {
       const ratio = p * 2;
@@ -333,17 +336,12 @@ function App() {
       return <p className="loading-text">Loading supply chain graph...</p>;
     }
 
-    // 1. FILTER TO "STATES" / KEY HUBS
-    // We sort by risk to ensure the most critical nodes are kept.
-    // Then we slice to 50 to create a cleaner, "State-Level" abstract view.
+    // 1. FILTER TO "STATES" / KEY HUBS (High-Level View)
     const allNodes = [...graphData.nodes].sort((a, b) => b.risk - a.risk);
     const displayNodes = allNodes.slice(0, 50); 
-    
-    // 2. CREATE SET OF VALID IDs FOR EDGE FILTERING
     const validNodeIds = new Set(displayNodes.map(n => n.id));
 
-    // 3. FILTER EDGES
-    // Only show edges where both Source and Target are in our top 50 list
+    // 2. FILTER EDGES
     const displayEdges = graphData.edges.filter(edge => 
         validNodeIds.has(edge.source) && validNodeIds.has(edge.target)
     );
@@ -354,10 +352,10 @@ function App() {
 
     const uniqueLabels = [...new Set(displayNodes.map((n) => n.label))];
     const nodePositions = {};
-    const nodeRiskMap = {}; // Lookup map for edge coloring logic
+    const nodeRiskMap = {}; // Lookup for edge coloring
 
     displayNodes.forEach((node, i) => {
-      nodeRiskMap[node.id] = node.risk || 0; // Store risk for edge lookup
+      nodeRiskMap[node.id] = node.risk || 0;
 
       const labelIdx = uniqueLabels.indexOf(node.label);
       const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
@@ -387,6 +385,8 @@ function App() {
         
         {/* ZOOM WRAPPER */}
         <g transform={transform.toString()}>
+            
+            {/* EDGES: Colored by Risk */}
             {displayEdges.map((edge, i) => {
                 const src = nodePositions[edge.source];
                 const tgt = nodePositions[edge.target];
@@ -396,36 +396,36 @@ function App() {
                 const srcRisk = nodeRiskMap[edge.source] || 0;
                 const tgtRisk = nodeRiskMap[edge.target] || 0;
                 const edgeRisk = Math.max(srcRisk, tgtRisk);
-                const edgeColor = getRiskColor(edgeRisk);
+                
+                // If prediction not run yet, use default grey, otherwise use risk color
+                const edgeColor = analysisRun ? getRiskColor(edgeRisk) : "rgba(255,255,255,0.1)";
 
                 return (
                     <line
                         key={`e-${i}`}
                         x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
-                        stroke={edgeColor} // Dynamic Edge Color
-                        strokeWidth="0.8" // Slightly thicker to see the color
-                        opacity="0.4"
+                        stroke={edgeColor} 
+                        strokeWidth="1.2" // Thicker to see the color
+                        opacity="0.6"     // Higher opacity for visibility
                         markerEnd="url(#arrowhead)"
                     />
                 );
             })}
+
+            {/* NODES: Fixed Blue */}
             {displayNodes.map((node) => {
                 const pos = nodePositions[node.id];
                 if (!pos) return null;
-                
-                // CALCULATE DYNAMIC COLOR using the gradient function
-                const nodeColor = getRiskColor(node.risk || 0);
 
                 return (
                     <g key={node.id}>
                         <circle
                             cx={pos.x} cy={pos.y} r={3 + (node.risk || 0) * 5}
-                            fill={nodeColor} 
+                            fill="#00f3ff" // <--- STATIC CYBER BLUE
                             opacity="0.9"
                             stroke="#fff"
-                            strokeWidth="0.2"
+                            strokeWidth="0.5"
                         />
-                        {/* Always show labels for these high-level nodes */}
                         <text
                             x={pos.x} y={pos.y - 8}
                             textAnchor="middle"
@@ -443,12 +443,14 @@ function App() {
         {/* Legend */}
         <g transform={`translate(${width - 130}, 20)`}>
           <rect x="0" y="0" width="120" height="70" fill="rgba(20,25,32,0.9)" rx="4" />
-          <circle cx="15" cy="18" r="5" fill="#00ff88" />
-          <text x="28" y="22" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Low Risk</text>
-          <circle cx="15" cy="38" r="5" fill="#ffd700" />
-          <text x="28" y="42" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Medium Risk</text>
-          <circle cx="15" cy="58" r="5" fill="#ff3864" />
-          <text x="28" y="62" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">High Risk</text>
+          <line x1="15" y1="20" x2="35" y2="20" stroke="#00ff88" strokeWidth="2" />
+          <text x="42" y="24" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Safe Route</text>
+          
+          <line x1="15" y1="40" x2="35" y2="40" stroke="#ffd700" strokeWidth="2" />
+          <text x="42" y="44" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Warning</text>
+          
+          <line x1="15" y1="60" x2="35" y2="60" stroke="#ff3864" strokeWidth="2" />
+          <text x="42" y="64" fill="#8b92a8" fontSize="9" fontFamily="Space Mono">Critical Path</text>
         </g>
       </svg>
     );
@@ -782,7 +784,7 @@ function App() {
                     <span className="panel-title">Supply Chain Network</span>
                     <span className="panel-badge">Color-coded by Risk</span>
                   </div>
-                  <p className="chart-subtitle">Nodes sized by risk score. Green = safe, Yellow = warning, Red = critical. Drag to rearrange.</p>
+                  <p className="chart-subtitle">Nodes sized by risk score. Routes colored by delay probability.</p>
                   {renderNetworkGraph()}
                 </div>
               </div>
