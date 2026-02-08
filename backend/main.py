@@ -416,14 +416,14 @@ def compute_predictions():
     # Add stochastic noise (Jitter) for simulation realism
     rng = np.random.default_rng(42)
     noise = rng.normal(0, 0.03, size=len(trip_preds)) # Small 3% jitter
-    trip_preds["risk"] = (trip_preds["risk"] + noise).clip(0.01, 0.99)
+    trip_preds["risk"] = (trip_preds["risk"] + noise).clip(0.0, 1.0)
 
     predictions_cache = {
         uid: {
             "risk": round(float(row["risk"]), 4),
             "expected_delay_hours": round(float(row["expected_delay_hours"]), 2),
         }
-        for uid, row in trip_preds.iterrows()
+        for uid, row in trip_preds.iterrows() if round(float(row["expected_delay_hours"]), 2) < 24
     }
 
     print(f"Predictions computed for {len(predictions_cache)} unique trips")
