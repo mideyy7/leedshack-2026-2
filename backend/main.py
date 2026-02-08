@@ -1037,6 +1037,8 @@ async def backtest_data():
     split_idx = int(len(df) * 0.7)
     test = df.iloc[split_idx:].copy()
 
+    len0_test = len(test)
+
     # Downsample to ~150 points for rendering
     n = min(150, len(test))
     if len(test) > n:
@@ -1061,6 +1063,6 @@ async def backtest_data():
         "points": points,
         "rmse": round(rmse, 4),
         "mae": round(mae, 4),
-        "test_size": int(len(test)),
+        "test_size": len0_test,
         "train_size": split_idx,
     }
