@@ -99,7 +99,10 @@ def _extract_city(node_name):
 def _extract_state(node_name):
     """Extract state from node like 'Agra_Central_D_3 (Uttar Pradesh)' -> 'Uttar Pradesh'."""
     match = re.search(r"\(([^)]+)\)", node_name)
-    return match.group(1) if match else None
+    # Basic cleanup
+    if match:
+        return match.group(1).strip()
+    return "Unknown Region"
 
 
 WEATHER_ATTRS = ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]
@@ -192,8 +195,6 @@ def load_weather():
     print(f"Weather merged: {matched_exact} exact, {matched_state} state-level, {matched_fallback} fallback")
 
 
-# --- Phase 4: Feature engineering & LightGBM training ---
-
 FEATURE_COLS = [
     "osrm_time", "actual_distance_to_destination", "segment_osrm_time",
     "segment_osrm_distance", "factor", "segment_factor",
@@ -237,10 +238,7 @@ def _build_feature_df():
     df["weather_main_encoded"] = df["weather_main_raw"].map(weather_main_map).fillna(0).astype(int)
 
     # Define targets
-    # Classification: delayed if factor > 1.5 (actual took 50%+ longer than OSRM estimate)
     df["is_delayed"] = (df["factor"] > 1.5).astype(int)
-
-    # Regression: delay in hours = (actual_time - osrm_time) / 60, clipped to >= 0
     df["delay_hours"] = ((df["actual_time"] - df["osrm_time"]) / 60).clip(lower=0)
 
     # Fill NaN in feature columns
@@ -260,7 +258,6 @@ def train_models():
     reg_path = os.path.join(MODEL_DIR, "regressor.pkl")
     meta_path = os.path.join(MODEL_DIR, "meta.pkl")
 
-    # If models already exist, load them
     if os.path.exists(clf_path) and os.path.exists(reg_path):
         risk_classifier = joblib.load(clf_path)
         delay_regressor = joblib.load(reg_path)
@@ -274,21 +271,18 @@ def train_models():
     y_cls = df["is_delayed"].values
     y_reg = df["delay_hours"].values
 
-    # Train classifier
     risk_classifier = lgb.LGBMClassifier(
         n_estimators=100, max_depth=6, learning_rate=0.1,
         num_leaves=31, verbose=-1, n_jobs=-1,
     )
     risk_classifier.fit(X, y_cls)
 
-    # Train regressor
     delay_regressor = lgb.LGBMRegressor(
         n_estimators=100, max_depth=6, learning_rate=0.1,
         num_leaves=31, verbose=-1, n_jobs=-1,
     )
     delay_regressor.fit(X, y_reg)
 
-    # Save models and metadata
     joblib.dump(risk_classifier, clf_path)
     joblib.dump(delay_regressor, reg_path)
     joblib.dump({"weather_main_map": weather_main_map}, meta_path)
@@ -310,7 +304,6 @@ def compute_predictions():
     risk_probs = risk_classifier.predict_proba(X)[:, 1]
     delay_hours = delay_regressor.predict(X)
 
-    # Aggregate per trip_uuid (take max risk and max delay across segments)
     df["risk"] = risk_probs
     df["predicted_delay_hours"] = np.clip(delay_hours, 0, None)
 
@@ -330,13 +323,10 @@ def compute_predictions():
     print(f"Predictions computed for {len(predictions_cache)} unique trips")
 
 
-# --- Phase 6: Monte Carlo simulation ---
-
 N_SIMULATIONS = 100
 
 
 def run_simulations():
-    """Run Monte Carlo simulations for all trips using the trained regressor."""
     global simulation_cache
 
     if delay_regressor is None:
@@ -346,28 +336,23 @@ def run_simulations():
     df, _ = _build_feature_df()
     rng = np.random.default_rng(42)
 
-    # Columns we'll perturb per simulation
     perturb_cols = ["osrm_time", "segment_osrm_time", "temperature", "humidity",
                     "wind_speed", "rain_1h", "snow_1h"]
 
     X_base = df[FEATURE_COLS].values.copy()
 
-    # Weather severity multiplier: heavier rain/snow/wind → more variance
     weather_severity = (
         df["rain_1h"].values * 0.3
         + df["snow_1h"].values * 0.5
         + df["wind_speed"].values * 0.02
-    ).clip(0, 1)  # 0-1 scale
+    ).clip(0, 1)
 
-    # Run N simulations, collect delay predictions for each row
     all_delays = np.zeros((len(df), N_SIMULATIONS))
-
     col_indices = [FEATURE_COLS.index(c) for c in perturb_cols]
 
     for sim in range(N_SIMULATIONS):
         X_sim = X_base.copy()
         for ci in col_indices:
-            # Perturb each feature by ±20%, scaled by weather severity
             noise_scale = 0.2 * (1 + weather_severity)
             noise = rng.normal(1.0, noise_scale, size=len(df))
             X_sim[:, ci] = X_base[:, ci] * noise
@@ -375,7 +360,6 @@ def run_simulations():
         preds = delay_regressor.predict(X_sim)
         all_delays[:, sim] = np.clip(preds, 0, None)
 
-    # Aggregate per trip_uuid
     df["best_case"] = np.min(all_delays, axis=1)
     df["worst_case"] = np.max(all_delays, axis=1)
     df["sim_expected"] = np.mean(all_delays, axis=1)
@@ -401,10 +385,8 @@ def run_simulations():
         for uid, row in trip_sims.iterrows()
     }
 
-    print(f"Monte Carlo simulations done for {len(simulation_cache)} trips ({N_SIMULATIONS} scenarios each)")
+    print(f"Monte Carlo simulations done for {len(simulation_cache)} trips")
 
-
-# --- Phase 7: Mitigation with Solana ---
 
 MITIGATION_STRATEGIES = [
     {"strategy": "Reroute shipment via alternate corridor", "expected_risk_reduction": 0.25},
@@ -414,24 +396,22 @@ MITIGATION_STRATEGIES = [
 
 
 def _select_strategy(risk):
-    """Pick a mitigation strategy based on risk severity."""
     if risk > 0.9:
-        return MITIGATION_STRATEGIES[0]  # reroute for very high risk
+        return MITIGATION_STRATEGIES[0]
     elif risk > 0.8:
-        return MITIGATION_STRATEGIES[1]  # expedite for high risk
+        return MITIGATION_STRATEGIES[1]
     else:
-        return MITIGATION_STRATEGIES[2]  # hold upstream for moderate-high
+        return MITIGATION_STRATEGIES[2]
 
 
 def _trigger_solana_memo(trip_uuid, risk, action_desc):
-    """Send a memo transaction to Solana devnet for audit trail. Returns tx signature or None."""
     import time
     try:
         client = SolanaClient(SOLANA_RPC_URL)
         keypair = SolanaKeypair()
 
         memo_text = f"ChainReaction|{trip_uuid}|risk:{risk:.2f}|action:{action_desc}"
-        memo_bytes = memo_text.encode("utf-8")[:566]  # memo max ~566 bytes
+        memo_bytes = memo_text.encode("utf-8")[:566]
 
         ix = Instruction(
             program_id=MEMO_PROGRAM_ID,
@@ -439,12 +419,9 @@ def _trigger_solana_memo(trip_uuid, risk, action_desc):
             data=memo_bytes,
         )
 
-        # Airdrop SOL for tx fee
-        airdrop_resp = client.request_airdrop(keypair.pubkey(), 1_000_000_000)  # 1 SOL
-        # Wait for airdrop confirmation
+        airdrop_resp = client.request_airdrop(keypair.pubkey(), 1_000_000_000)
         time.sleep(3)
 
-        # Get a recent blockhash and build transaction
         resp = client.get_latest_blockhash()
         blockhash = resp.value.blockhash
 
@@ -461,15 +438,12 @@ def _trigger_solana_memo(trip_uuid, risk, action_desc):
         return sig
     except Exception as e:
         print(f"Solana tx failed for {trip_uuid}: {e}")
-        # Demo fallback: generate a deterministic mock signature for hackathon presentation
         import hashlib
         mock_sig = hashlib.sha256(f"ChainReaction:{trip_uuid}:{risk}".encode()).hexdigest()[:88]
-        print(f"Using demo signature for {trip_uuid}")
         return f"DEMO_{mock_sig}"
 
 
 def compute_mitigations():
-    """Generate mitigation strategies for high-risk shipments, optionally trigger Solana."""
     global mitigation_cache
 
     if predictions_cache is None:
@@ -481,7 +455,6 @@ def compute_mitigations():
 
     print(f"Computing mitigations for {len(high_risk)} high-risk shipments...")
 
-    # Only send Solana txs for top 3 riskiest (demo budget — devnet airdrop is rate-limited)
     sorted_high = sorted(high_risk.items(), key=lambda x: x[1]["risk"], reverse=True)
     top_for_chain = set(uid for uid, _ in sorted_high[:3]) if SOLANA_ENABLED else set()
 
@@ -499,14 +472,10 @@ def compute_mitigations():
             "solana_tx": solana_tx,
         }
 
-    on_chain_count = sum(1 for m in mitigation_cache.values() if m["solana_tx"])
-    print(f"Mitigations computed: {len(mitigation_cache)} strategies, {on_chain_count} on-chain txs")
+    print(f"Mitigations computed: {len(mitigation_cache)} strategies")
 
-
-# --- Phase 8: Journey Stories ---
 
 def _determine_state(risk):
-    """Classify shipment state based on risk score."""
     if risk > 0.7:
         return "delayed"
     elif risk > 0.4:
@@ -515,7 +484,6 @@ def _determine_state(risk):
 
 
 def _get_weather_cause(trip_uuid):
-    """Find the dominant weather factor for a shipment's source node."""
     if shipments_df is None or graph is None:
         return None
 
@@ -531,68 +499,40 @@ def _get_weather_cause(trip_uuid):
     wind = float(attrs.get("wind_speed", 0))
     weather = attrs.get("weather_main", "Clear")
 
-    if snow > 0:
-        return f"snowfall ({weather})"
-    if rain > 0.5:
-        return f"heavy rain ({weather})"
-    if wind > 10:
-        return f"high winds ({weather})"
-    if rain > 0:
-        return f"rain ({weather})"
-    if weather not in ("Clear", "Clouds"):
-        return weather.lower()
+    if snow > 0: return f"snowfall ({weather})"
+    if rain > 0.5: return f"heavy rain ({weather})"
+    if wind > 10: return f"high winds ({weather})"
+    if rain > 0: return f"rain ({weather})"
+    if weather not in ("Clear", "Clouds"): return weather.lower()
     return None
 
 
 def _build_story(trip_uuid, pred, sim_data, mitigation_data):
-    """Generate a human-readable journey story for a shipment."""
     risk = pred["risk"]
     delay = pred["expected_delay_hours"]
     current = _determine_state(risk)
-    previous = "on-time"  # all shipments start on-time
+    previous = "on-time"
 
     cause = _get_weather_cause(trip_uuid)
     cause_phrase = f" due to {cause}" if cause else ""
 
-    # Build the narrative
     if current == "on-time":
-        story = (
-            f"Shipment {trip_uuid} is on-time with a low risk score of "
-            f"{risk*100:.0f}%. No delays expected."
-        )
+        story = f"Shipment {trip_uuid} is on-time with a low risk score of {risk*100:.0f}%. No delays expected."
     elif current == "at-risk":
-        story = (
-            f"Shipment {trip_uuid} was on-time until risk increased to "
-            f"{risk*100:.0f}%{cause_phrase}. "
-            f"Expected delay is {delay:.1f} hours. Monitoring closely."
-        )
-    else:  # delayed
-        story = (
-            f"Shipment {trip_uuid} was on-time until risk surged to "
-            f"{risk*100:.0f}%{cause_phrase}, triggering a delayed state. "
-            f"Expected delay is {delay:.1f} hours."
-        )
+        story = f"Shipment {trip_uuid} was on-time until risk increased to {risk*100:.0f}%{cause_phrase}. Expected delay is {delay:.1f} hours."
+    else:
+        story = f"Shipment {trip_uuid} was on-time until risk surged to {risk*100:.0f}%{cause_phrase}, triggering a delayed state. Expected delay is {delay:.1f} hours."
 
-        # Add simulation context if available
-        if sim_data:
-            story += (
-                f" Monte Carlo analysis shows delays ranging from "
-                f"{sim_data['best_case']:.1f}h (best) to "
-                f"{sim_data['worst_case']:.1f}h (worst case)."
-            )
+    if sim_data:
+        story += f" Monte Carlo: {sim_data['best_case']:.1f}h (best) to {sim_data['worst_case']:.1f}h (worst)."
 
-        # Add mitigation context if available
-        if mitigation_data:
-            story += (
-                f" Mitigation applied: {mitigation_data['strategy']}. "
-                f"Risk reduced by {mitigation_data['expected_risk_reduction']*100:.0f}%."
-            )
+    if mitigation_data:
+        story += f" Mitigation applied: {mitigation_data['strategy']}."
 
     return story, previous, current
 
 
 def generate_stories():
-    """Generate journey stories for top risky shipments, optionally store on Solana."""
     global story_cache
 
     if predictions_cache is None:
@@ -600,19 +540,11 @@ def generate_stories():
         return
 
     story_cache = {}
-
-    # Sort by risk desc, generate stories for top 20 non-trivial shipments
-    sorted_trips = sorted(
-        predictions_cache.items(), key=lambda x: x[1]["risk"], reverse=True
-    )
-
-    # Only generate stories for at-risk or delayed shipments (risk > 0.4)
+    sorted_trips = sorted(predictions_cache.items(), key=lambda x: x[1]["risk"], reverse=True)
     risky_trips = [(uid, p) for uid, p in sorted_trips if p["risk"] > 0.4][:20]
-
-    # Top 3 get Solana memos
     top_for_chain = set(uid for uid, _ in risky_trips[:3]) if SOLANA_ENABLED else set()
 
-    print(f"Generating journey stories for {len(risky_trips)} shipments...")
+    print(f"Generating stories for {len(risky_trips)} shipments...")
 
     for uid, pred in risky_trips:
         sim_data = simulation_cache.get(uid) if simulation_cache else None
@@ -634,27 +566,21 @@ def generate_stories():
             "solana_tx": solana_tx,
         }
 
-    on_chain = sum(1 for s in story_cache.values() if s["solana_tx"])
-    print(f"Stories generated: {len(story_cache)} stories, {on_chain} on-chain")
+    print(f"Stories generated: {len(story_cache)}")
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Load data, build graph, and load models on startup. No inference runs here."""
     print("Starting up Chain-Reaction API...")
     load_shipments()
     load_weather()
     train_models()
-    print("Startup complete. Awaiting /run-analysis to execute pipeline.")
+    print("Startup complete. Awaiting /run-analysis.")
 
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Chain-Reaction Supply Chain API",
-        "version": "1.0.0",
-        "status": "running",
-    }
+    return {"message": "Chain-Reaction Supply Chain API", "version": "1.0.0"}
 
 
 @app.get("/health")
@@ -670,27 +596,23 @@ async def health_check():
 
 @app.post("/run-analysis")
 async def run_analysis():
-    """Execute the full analysis pipeline: predict, simulate, mitigate, generate stories."""
     global analysis_executed
 
-    if graph is None or shipments_df is None:
-        return {"error": "Data not loaded. Cannot run analysis."}
-    if risk_classifier is None or delay_regressor is None:
-        return {"error": "Models not loaded. Cannot run analysis."}
+    if graph is None or shipments_df is None or risk_classifier is None:
+        return {"error": "System not ready. Data or models missing."}
 
     print("Running full analysis pipeline...")
-
     compute_predictions()
     run_simulations()
     compute_mitigations()
     generate_stories()
 
     analysis_executed = True
-
-    high_risk = sum(1 for v in predictions_cache.values() if v["risk"] > 0.7) if predictions_cache else 0
-    total = len(predictions_cache) if predictions_cache else 0
-
     print("Analysis pipeline complete.")
+    
+    total = len(predictions_cache) if predictions_cache else 0
+    high_risk = sum(1 for v in predictions_cache.values() if v["risk"] > 0.7) if predictions_cache else 0
+
     return {
         "status": "complete",
         "total_trips": total,
@@ -701,184 +623,123 @@ async def run_analysis():
     }
 
 
-@app.get("/graph/stats")
-async def graph_stats():
-    """Return graph statistics to verify Phase 2."""
-    if graph is None:
-        return {"error": "Graph not loaded"}
-
-    # Pick a sample edge for inspection
-    sample_edge = None
-    edges_list = list(graph.edges(data=True))
-    if edges_list:
-        src, dst, attrs = edges_list[0]
-        sample_edge = {"source": src, "destination": dst, **attrs}
-
-    # Pick a sample node
-    sample_node = None
-    nodes_list = list(graph.nodes(data=True))
-    if nodes_list:
-        name, attrs = nodes_list[0]
-        sample_node = {"name": name, **attrs}
-
-    return {
-        "num_nodes": graph.number_of_nodes(),
-        "num_edges": graph.number_of_edges(),
-        "sample_edge": sample_edge,
-        "sample_node": sample_node,
-        "total_shipment_records": len(shipments_df) if shipments_df is not None else 0,
-    }
-
-
-@app.get("/weather/stats")
-async def weather_stats():
-    """Return weather merge statistics to verify Phase 3."""
-    if graph is None:
-        return {"error": "Graph not loaded"}
-
-    nodes_with_weather = sum(1 for _, d in graph.nodes(data=True) if "temperature" in d)
-    nodes_without = graph.number_of_nodes() - nodes_with_weather
-
-    # Sample a node that has weather data
-    sample = None
-    for name, attrs in graph.nodes(data=True):
-        if "temperature" in attrs:
-            sample = {"name": name, **{k: attrs[k] for k in ["state", "historical_delay_prob"] + WEATHER_ATTRS}}
-            break
-
-    return {
-        "total_nodes": graph.number_of_nodes(),
-        "nodes_with_weather": nodes_with_weather,
-        "nodes_without_weather": nodes_without,
-        "weather_records_loaded": len(weather_df) if weather_df is not None else 0,
-        "sample_node_with_weather": sample,
-    }
-
-
-@app.post("/predict")
-async def predict():
-    """Return risk predictions for all shipments (Phase 5)."""
-    if predictions_cache is None:
-        return {"error": "Predictions not computed yet"}
-    return predictions_cache
-
-
-@app.post("/simulate")
-async def simulate():
-    """Return Monte Carlo simulation results for all shipments (Phase 6)."""
-    if simulation_cache is None:
-        return {"error": "Simulations not computed yet"}
-    return simulation_cache
-
-
-@app.post("/mitigate")
-async def mitigate():
-    """Return mitigation strategies for high-risk shipments (Phase 7)."""
-    if mitigation_cache is None:
-        return {"error": "Mitigations not computed yet"}
-    return mitigation_cache
-
-
-@app.get("/story")
-async def get_stories():
-    """Return journey stories for risky shipments (Phase 8)."""
-    if story_cache is None:
-        return {"error": "Stories not generated yet"}
-    return story_cache
-
-
 @app.get("/graph/viz")
 async def graph_viz():
-    """Return graph nodes and edges for network visualization.
-    Before analysis: neutral colors showing structure only.
-    After analysis: risk-colored nodes and edges.
+    """
+    Return aggregated graph nodes and edges grouped by STATE.
+    Aggregates risk from individual facilities up to the state level.
     """
     if graph is None:
         return {"error": "Graph not loaded"}
 
-    # Build node risk from predictions (only if analysis has run)
-    node_risk = {}
-    if analysis_executed and predictions_cache and shipments_df is not None:
-        df = shipments_df.copy()
-        df["risk"] = df["trip_uuid"].map(
-            lambda uid: predictions_cache.get(uid, {}).get("risk", 0)
-        )
-        for col in ["source_name", "destination_name"]:
-            agg = df.groupby(col)["risk"].mean()
-            for name, risk in agg.items():
-                node_risk[name] = max(node_risk.get(name, 0), float(risk))
+    # 1. Map Shipments to Risk (if analysis executed)
+    # We create a lookup of risk by trip_uuid
+    trip_risk_lookup = {}
+    if analysis_executed and predictions_cache:
+        for uid, data in predictions_cache.items():
+            trip_risk_lookup[uid] = data.get("risk", 0.0)
 
-    # Determine node type from name patterns
-    def _node_type(name):
-        lower = name.lower()
-        if "port" in lower or "harbour" in lower:
-            return "port"
-        if "warehouse" in lower or "wh" in lower or "distribution" in lower:
-            return "warehouse"
-        if "hub" in lower or "central" in lower:
-            return "hub"
-        return "supplier"
+    # 2. Map Nodes (Facilities) to Risk
+    # We iterate through shipments_df to find which nodes are associated with which trips
+    node_risks = {}  # {node_name: [list of risks]}
+    
+    if analysis_executed and shipments_df is not None:
+        # Create a quick lookup for risk per shipment row
+        # This is faster than iterating rows if dataframe is large
+        shipments_df['temp_risk'] = shipments_df['trip_uuid'].map(trip_risk_lookup).fillna(0.0)
+        
+        # Group by Source and Dest to collect risks
+        src_risks = shipments_df.groupby("source_name")['temp_risk'].apply(list).to_dict()
+        dst_risks = shipments_df.groupby("destination_name")['temp_risk'].apply(list).to_dict()
+        
+        # Merge source and dest risks into node_risks
+        for node in graph.nodes:
+            risks = src_risks.get(node, []) + dst_risks.get(node, [])
+            if risks:
+                node_risks[node] = risks
 
-    nodes = []
-    for name in graph.nodes:
-        state = graph.nodes[name].get("state", "on-time")
-        risk = node_risk.get(name, 0)
+    # 3. Aggregate by STATE
+    state_nodes = {}  # {state_name: {risk_sum, count, type}}
+    
+    for node in graph.nodes:
+        state = _extract_state(node)
+        if not state or state == "Unknown Region": 
+            continue # Skip nodes without clear state mapping for the high-level view
+
+        if state not in state_nodes:
+            state_nodes[state] = {"risk_values": [], "facility_count": 0}
+        
+        state_nodes[state]["facility_count"] += 1
+        
+        # If we have risks for this specific facility, add them to the state bucket
+        if node in node_risks:
+            state_nodes[state]["risk_values"].extend(node_risks[node])
+
+    # 4. Build Final Node List
+    final_nodes = []
+    for state, data in state_nodes.items():
+        # Calculate average risk for the state
+        avg_risk = 0.0
+        if data["risk_values"]:
+            avg_risk = sum(data["risk_values"]) / len(data["risk_values"])
+        
+        # Determine color based on risk
+        color = "#3b82f6" # default blue
         if analysis_executed:
-            color = "#ff3864" if risk > 0.7 else "#ffd700" if risk > 0.4 else "#00ff88"
-        else:
-            color = "#3b82f6"  # neutral blue before analysis
+            if avg_risk > 0.7: color = "#ff3864"
+            elif avg_risk > 0.4: color = "#ffd700"
+            else: color = "#00ff88"
 
-        nodes.append({
-            "id": name,
-            "label": name.split("(")[0].strip().split("_")[0],
-            "risk": round(risk, 4),
-            "state": state,
-            "type": _node_type(name),
-            "color": color,
+        final_nodes.append({
+            "id": state,
+            "label": state,
+            "risk": round(avg_risk, 4),
+            "type": "state_hub",
+            "color": color
         })
 
-    edges = []
-    for src, dst, attrs in graph.edges(data=True):
-        if analysis_executed:
-            src_risk = node_risk.get(src, 0)
-            dst_risk = node_risk.get(dst, 0)
-            edge_risk = max(src_risk, dst_risk)
-            edge_color = "#ff3864" if edge_risk > 0.7 else "#ffd700" if edge_risk > 0.4 else "#00ff88"
-        else:
-            edge_color = "rgba(59,130,246,0.4)"  # neutral blue before analysis
+    # 5. Build Aggregated Edges
+    # We iterate existing edges and map them to State -> State edges
+    state_edges = {} # {(state_a, state_b): {count}}
 
-        edges.append({
+    for u, v in graph.edges:
+        state_u = _extract_state(u)
+        state_v = _extract_state(v)
+
+        if state_u and state_v and state_u != state_v and state_u != "Unknown Region" and state_v != "Unknown Region":
+            key = (state_u, state_v)
+            if key not in state_edges:
+                state_edges[key] = 0
+            state_edges[key] += 1
+
+    final_edges = []
+    for (src, dst), count in state_edges.items():
+        final_edges.append({
             "source": src,
             "target": dst,
-            "transit_time": attrs.get("transit_time", 0),
-            "distance": attrs.get("distance", 0),
-            "color": edge_color,
+            "weight": count,
+            "color": "rgba(139, 146, 168, 0.4)" # default grey
         })
 
-    return {"nodes": nodes, "edges": edges, "analysis_executed": analysis_executed}
+    return {"nodes": final_nodes, "edges": final_edges, "analysis_executed": analysis_executed}
 
 
-@app.get("/risk/stats")
-async def risk_stats():
-    """Return risk model statistics to verify Phase 4."""
-    if predictions_cache is None:
-        return {"error": "Predictions not computed"}
+@app.post("/predict")
+async def predict():
+    if predictions_cache is None: return {"error": "Predictions not computed"}
+    return predictions_cache
 
-    risks = [v["risk"] for v in predictions_cache.values()]
-    delays = [v["expected_delay_hours"] for v in predictions_cache.values()]
+@app.post("/simulate")
+async def simulate():
+    if simulation_cache is None: return {"error": "Simulations not computed"}
+    return simulation_cache
 
-    # Sample top-5 riskiest trips
-    sorted_trips = sorted(predictions_cache.items(), key=lambda x: x[1]["risk"], reverse=True)
-    top_5 = {uid: pred for uid, pred in sorted_trips[:5]}
+@app.post("/mitigate")
+async def mitigate():
+    if mitigation_cache is None: return {"error": "Mitigations not computed"}
+    return mitigation_cache
 
-    return {
-        "total_trips": len(predictions_cache),
-        "risk_mean": round(float(np.mean(risks)), 4),
-        "risk_max": round(float(np.max(risks)), 4),
-        "risk_min": round(float(np.min(risks)), 4),
-        "delay_mean_hours": round(float(np.mean(delays)), 2),
-        "delay_max_hours": round(float(np.max(delays)), 2),
-        "high_risk_trips": sum(1 for r in risks if r > 0.7),
-        "models_loaded": risk_classifier is not None and delay_regressor is not None,
-        "top_5_riskiest": top_5,
-    }
+@app.get("/story")
+async def get_stories():
+    if story_cache is None: return {"error": "Stories not generated"}
+    return story_cache

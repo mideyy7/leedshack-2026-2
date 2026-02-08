@@ -132,7 +132,7 @@ function App() {
     }
   }, [apiStatus, fetchGraphData]);
 
-  // --- D3 ZOOM EFFECT (The Critical Fix) ---
+  // --- D3 ZOOM EFFECT ---
   useEffect(() => {
     if (!svgRef.current) return;
 
@@ -145,7 +145,7 @@ function App() {
 
     svg.call(zoom);
     svg.style("user-select", "none");
-  }, [loading, graphData]); // Re-run when data loads
+  }, [loading, graphData]); 
 
   // --- MAIN DATA LOAD EFFECT ---
   useEffect(() => {
@@ -208,15 +208,23 @@ function App() {
         }))
     : [];
 
+  // --- RISK COLOR CALCULATOR ---
   const getRiskColor = (risk) => {
-    if (risk >= 70) return '#ff3864';
-    if (risk >= 40) return '#ffd700';
-    return '#00ff88';
+    const p = Math.max(0, Math.min(1, risk));
+    if (p < 0.5) {
+      const ratio = p * 2;
+      const r = Math.floor(255 * ratio);
+      return `rgb(${r}, 255, 0)`;
+    } else {
+      const ratio = (p - 0.5) * 2;
+      const g = Math.floor(255 * (1 - ratio));
+      return `rgb(255, ${g}, 0)`;
+    }
   };
 
   const coloredChartData = chartData.map((entry) => ({
     ...entry,
-    fill: getRiskColor(entry.risk),
+    fill: getRiskColor(entry.risk / 100),
   }));
 
   const simChartData = simulations
@@ -325,21 +333,38 @@ function App() {
       return <p className="loading-text">Loading supply chain graph...</p>;
     }
 
-    const nodes = [...graphData.nodes].sort((a, b) => b.risk - a.risk);    
-    const edges = graphData.edges;
+    // 1. FILTER TO "STATES" / KEY HUBS
+    // We sort by risk to ensure the most critical nodes are kept.
+    // Then we slice to 50 to create a cleaner, "State-Level" abstract view.
+    const allNodes = [...graphData.nodes].sort((a, b) => b.risk - a.risk);
+    const displayNodes = allNodes.slice(0, 50); 
+    
+    // 2. CREATE SET OF VALID IDs FOR EDGE FILTERING
+    const validNodeIds = new Set(displayNodes.map(n => n.id));
+
+    // 3. FILTER EDGES
+    // Only show edges where both Source and Target are in our top 50 list
+    const displayEdges = graphData.edges.filter(edge => 
+        validNodeIds.has(edge.source) && validNodeIds.has(edge.target)
+    );
+
     const width = 800;
     const height = 500;
     const padding = 60;
 
-    const uniqueLabels = [...new Set(nodes.map((n) => n.label))];
+    const uniqueLabels = [...new Set(displayNodes.map((n) => n.label))];
     const nodePositions = {};
-    nodes.forEach((node, i) => {
+    const nodeRiskMap = {}; // Lookup map for edge coloring logic
+
+    displayNodes.forEach((node, i) => {
+      nodeRiskMap[node.id] = node.risk || 0; // Store risk for edge lookup
+
       const labelIdx = uniqueLabels.indexOf(node.label);
       const angle = (2 * Math.PI * labelIdx) / uniqueLabels.length;
       
       const spiralOffset = (i * 3); 
-      // Adjusted spread logic for 1600 nodes
-      const radius = (Math.min(width, height) / 2 - padding) + (i % 8 * 30);
+      // Adjusted spread logic for fewer nodes
+      const radius = (Math.min(width, height) / 2 - padding) + (i % 5 * 30);
       
       nodePositions[node.id] = {
         x: width / 2 + (radius + spiralOffset) * Math.cos(angle),
@@ -362,51 +387,60 @@ function App() {
         
         {/* ZOOM WRAPPER */}
         <g transform={transform.toString()}>
-            {edges.map((edge, i) => {
+            {displayEdges.map((edge, i) => {
                 const src = nodePositions[edge.source];
                 const tgt = nodePositions[edge.target];
                 if (!src || !tgt) return null;
+
+                // Calculate Edge Risk: Max of source or target risk
+                const srcRisk = nodeRiskMap[edge.source] || 0;
+                const tgtRisk = nodeRiskMap[edge.target] || 0;
+                const edgeRisk = Math.max(srcRisk, tgtRisk);
+                const edgeColor = getRiskColor(edgeRisk);
+
                 return (
                     <line
                         key={`e-${i}`}
                         x1={src.x} y1={src.y} x2={tgt.x} y2={tgt.y}
-                        stroke={edge.color}
-                        strokeWidth="0.5"
-                        opacity="0.1"
+                        stroke={edgeColor} // Dynamic Edge Color
+                        strokeWidth="0.8" // Slightly thicker to see the color
+                        opacity="0.4"
                         markerEnd="url(#arrowhead)"
                     />
                 );
             })}
-            {nodes.map((node) => {
+            {displayNodes.map((node) => {
                 const pos = nodePositions[node.id];
                 if (!pos) return null;
+                
+                // CALCULATE DYNAMIC COLOR using the gradient function
+                const nodeColor = getRiskColor(node.risk || 0);
+
                 return (
                     <g key={node.id}>
                         <circle
-                            cx={pos.x} cy={pos.y} r={3 + node.risk * 5}
-                            fill={node.color}
-                            opacity="0.8"
+                            cx={pos.x} cy={pos.y} r={3 + (node.risk || 0) * 5}
+                            fill={nodeColor} 
+                            opacity="0.9"
                             stroke="#fff"
                             strokeWidth="0.2"
                         />
-                        {/* High risk labels only */}
-                        {node.risk > 0.7 && (
-                            <text
-                                x={pos.x} y={pos.y - 8}
-                                textAnchor="middle"
-                                fill="#8b92a8"
-                                fontSize="6"
-                                fontFamily="Space Mono"
-                            >
-                                {node.label}
-                            </text>
-                        )}
+                        {/* Always show labels for these high-level nodes */}
+                        <text
+                            x={pos.x} y={pos.y - 8}
+                            textAnchor="middle"
+                            fill="#8b92a8"
+                            fontSize="6"
+                            fontFamily="Space Mono"
+                        >
+                            {node.label}
+                        </text>
                     </g>
                 );
             })}
         </g>
         
-        {/* Legend (Fixed position, outside zoom group) */}
+        {/* Legend */}
         <g transform={`translate(${width - 130}, 20)`}>
           <rect x="0" y="0" width="120" height="70" fill="rgba(20,25,32,0.9)" rx="4" />
           <circle cx="15" cy="18" r="5" fill="#00ff88" />
@@ -428,7 +462,7 @@ function App() {
 
   const isHealthy = apiStatus?.status === 'healthy';
 
-  // "Not yet run" placeholder for analysis tabs
+  // "Not yet run" placeholder
   const renderNotRunPlaceholder = (tabName) => (
     <div className="panel not-run-panel">
       <div className="not-run-content">
