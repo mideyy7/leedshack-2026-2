@@ -108,16 +108,16 @@ def _extract_state(node_name):
     return match.group(1) if match else None
 
 
-WEATHER_ATTRS = ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h", "weather_main"]
+WEATHER_ATTRS = ["tempC", "humidity", "pressure", "windGustKmph"]  # "rain_1h", "snow_1h"]
 
 
 def load_weather():
     """Load weather CSV and merge weather attributes onto graph nodes."""
     global weather_df
 
-    csv_path = os.path.join(DATA_DIR, "weather.csv")
+    csv_path = os.path.join(DATA_DIR, "weather2.csv")
     if not os.path.exists(csv_path):
-        print("WARNING: weather.csv not found at", csv_path)
+        print("WARNING: weather2.csv not found at", csv_path)
         return
 
     weather_df = pd.read_csv(csv_path, low_memory=False)
