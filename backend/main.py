@@ -202,7 +202,6 @@ FEATURE_COLS = [
     "hour_of_day", "day_of_week", "is_peak_hour",
 ]
 
-
 def _build_feature_df():
     """Build a feature DataFrame by merging shipment rows with graph weather attributes."""
     df = shipments_df.copy()
@@ -233,14 +232,19 @@ def _build_feature_df():
     for col in ["temperature", "humidity", "wind_speed", "rain_1h", "snow_1h"]:
         df[col] = df["source_name"].map(lambda n, c=col: weather_lookup.get(n, {}).get(c, 0.0))
 
+    # --- CHANGE 1: Weather Dampening ---
+    # Reduce impact of rain/snow so it doesn't immediately spike risk to 100%
+    df["rain_1h"] = df["rain_1h"] * 0.4
+    df["snow_1h"] = df["snow_1h"] * 0.4 
+    
     df["weather_main_raw"] = df["source_name"].map(lambda n: weather_lookup.get(n, {}).get("weather_main", "Clouds"))
     df["weather_main_encoded"] = df["weather_main_raw"].map(weather_main_map).fillna(0).astype(int)
 
-    # Define targets
-    # Classification: delayed if factor > 1.5 (actual took 50%+ longer than OSRM estimate)
-    df["is_delayed"] = (df["factor"] > 1.5).astype(int)
+    # --- CHANGE 2: Stricter Thresholds ---
+    # Only flag as delayed if it took > 2.0x the expected time (was 1.5)
+    df["is_delayed"] = (df["factor"] > 2.0).astype(int)
 
-    # Regression: delay in hours = (actual_time - osrm_time) / 60, clipped to >= 0
+    # Regression: delay in hours
     df["delay_hours"] = ((df["actual_time"] - df["osrm_time"]) / 60).clip(lower=0)
 
     # Fill NaN in feature columns
@@ -249,7 +253,6 @@ def _build_feature_df():
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     return df, weather_main_map
-
 
 def train_models():
     """Train LightGBM classifier and regressor, save to disk."""
@@ -295,7 +298,6 @@ def train_models():
 
     print(f"Models trained and saved. Delay rate: {y_cls.mean():.2%}, Mean delay: {y_reg.mean():.1f}h")
 
-
 def compute_predictions():
     """Run predictions for all shipments and cache results."""
     global predictions_cache
@@ -307,17 +309,44 @@ def compute_predictions():
     df, _ = _build_feature_df()
     X = df[FEATURE_COLS].values
 
-    risk_probs = risk_classifier.predict_proba(X)[:, 1]
-    delay_hours = delay_regressor.predict(X)
+    # 1. Get Raw Probabilities & Delays
+    raw_risk_probs = risk_classifier.predict_proba(X)[:, 1]
+    raw_delay_hours = delay_regressor.predict(X)
 
-    # Aggregate per trip_uuid (take max risk and max delay across segments)
-    df["risk"] = risk_probs
-    df["predicted_delay_hours"] = np.clip(delay_hours, 0, None)
+    df["raw_risk"] = raw_risk_probs
+    df["predicted_delay_hours"] = np.clip(raw_delay_hours, 0, None)
+
+    # --- NEW LOGIC: SEVERITY ADJUSTMENT ---
+    
+    # Define a "Critical Delay Threshold" (e.g., 2 hours). 
+    # If delay < 2 hours, we dampen the risk score.
+    # If delay >= 2 hours, we keep the full risk score.
+    CRITICAL_DELAY_HOURS = 2.0
+    
+    # Create a multiplier: 0.1h delay -> 0.05 multiplier; 2.0h delay -> 1.0 multiplier
+    # We add a small base (0.2) so even small delays satisfy "some" risk, but not 95%
+    df["severity_multiplier"] = (df["predicted_delay_hours"] / CRITICAL_DELAY_HOURS).clip(0.2, 1.0)
+    
+    # Calculate Final Risk: Certainty * Severity
+    df["adjusted_risk"] = df["raw_risk"] * df["severity_multiplier"]
+
+    # --------------------------------------
+
+    # Aggregate per trip (Weighted Average Logic from previous step)
+    trip_totals = df.groupby("trip_uuid")["segment_osrm_distance"].transform("sum")
+    df["segment_weight"] = df["segment_osrm_distance"] / trip_totals.replace(0, 1)
+    
+    df["weighted_risk"] = df["adjusted_risk"] * df["segment_weight"]
 
     trip_preds = df.groupby("trip_uuid").agg(
-        risk=("risk", "max"),
-        expected_delay_hours=("predicted_delay_hours", "max"),
+        risk=("weighted_risk", "sum"),
+        expected_delay_hours=("predicted_delay_hours", "sum"), # Summing delay across segments
     )
+
+    # Add stochastic noise (Jitter) for simulation realism
+    rng = np.random.default_rng(42)
+    noise = rng.normal(0, 0.03, size=len(trip_preds)) # Small 3% jitter
+    trip_preds["risk"] = (trip_preds["risk"] + noise).clip(0.01, 0.99)
 
     predictions_cache = {
         uid: {
@@ -329,11 +358,9 @@ def compute_predictions():
 
     print(f"Predictions computed for {len(predictions_cache)} unique trips")
 
-
 # --- Phase 6: Monte Carlo simulation ---
 
 N_SIMULATIONS = 100
-
 
 def run_simulations():
     """Run Monte Carlo simulations for all trips using the trained regressor."""
@@ -346,29 +373,26 @@ def run_simulations():
     df, _ = _build_feature_df()
     rng = np.random.default_rng(42)
 
-    # Columns we'll perturb per simulation
     perturb_cols = ["osrm_time", "segment_osrm_time", "temperature", "humidity",
                     "wind_speed", "rain_1h", "snow_1h"]
 
     X_base = df[FEATURE_COLS].values.copy()
 
-    # Weather severity multiplier: heavier rain/snow/wind → more variance
     weather_severity = (
         df["rain_1h"].values * 0.3
         + df["snow_1h"].values * 0.5
         + df["wind_speed"].values * 0.02
-    ).clip(0, 1)  # 0-1 scale
+    ).clip(0, 1)
 
-    # Run N simulations, collect delay predictions for each row
     all_delays = np.zeros((len(df), N_SIMULATIONS))
-
     col_indices = [FEATURE_COLS.index(c) for c in perturb_cols]
 
     for sim in range(N_SIMULATIONS):
         X_sim = X_base.copy()
         for ci in col_indices:
-            # Perturb each feature by ±20%, scaled by weather severity
-            noise_scale = 0.2 * (1 + weather_severity)
+            # --- CHANGE 4: Increased Variance ---
+            # Increase noise scale from 0.2 to 0.3 for more "drama" in the simulation
+            noise_scale = 0.3 * (1 + weather_severity)
             noise = rng.normal(1.0, noise_scale, size=len(df))
             X_sim[:, ci] = X_base[:, ci] * noise
 
@@ -402,7 +426,6 @@ def run_simulations():
     }
 
     print(f"Monte Carlo simulations done for {len(simulation_cache)} trips ({N_SIMULATIONS} scenarios each)")
-
 
 # --- Phase 7: Mitigation with Solana ---
 
